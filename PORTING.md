@@ -194,13 +194,33 @@ before building further.
 - `NetworkAllowlist` behind the `http_client` feature. Default deny. Switch the
   relevant NIF to `DirtyIo` since real sockets can block.
 
-### Phase 6 — Elixir-defined custom builtins (the high-value, hard part)
-- bashkit lets you register an `async` `Builtin`. To call back into Elixir from
-  inside a dirty NIF, use the Rustler 0.37-friendly pattern: the builtin sends a
-  message to a registered Elixir process (or uses an `OwnedEnv` + `send`) and
-  blocks on a reply channel; Elixir runs the handler and sends the result back.
-  This is how you recover monty-style per-effect mediation (e.g. an `http`
-  builtin that asks your app to approve each request).
+### Phase 6 — Elixir-defined virtual executables & a dynamic VFS (high value)
+bashkit's runtime extension points are first-class — dynamic feeding is *not*
+limited to static seeding:
+
+- **Virtual executables:** register an `async` `Builtin` via
+  `.builtin("name", ...)`. A script line `db_query "..."` then invokes your
+  Rust code. This is the canonical back-call mechanism (e.g. an `http` builtin
+  that asks your app to approve each request — monty-style mediation, recovered).
+- **Dynamic virtual filesystem:** `FileSystem` is a trait with `async`
+  `read_file`/`write_file`/`read_dir`. Implement a backend that generates
+  content on demand or proxies reads to Elixir — files don't have to exist
+  ahead of time. Static seeding of `InMemoryFs` is just the zero-bridge option.
+
+**The bridge (the one real cost, shared by both):** the trait methods run
+*inside* the async execution that we're already `block_on`-ing. To reach Elixir,
+do a **blocking round-trip**: `OwnedEnv` + `send` to a registered pid, then block
+on a reply channel; an Elixir handler computes and a tiny delivery NIF pushes the
+result back into the channel. Notes that keep this sane:
+- You **don't** need elaborate async-to-Elixir plumbing. The `async fn` can call
+  a plain *synchronous* blocking bridge function (wrap it in
+  `tokio::task::block_in_place` to avoid stalling the worker). bashkit also
+  exposes a synchronous `SyncToolExec` callback type for the agent-tool layer
+  (phase 9).
+- **No reentrancy:** the Elixir handler must not call back into the *same*
+  (Mutex-locked) session, or you deadlock. Make that a hard rule in the contract.
+- The round-trip **pins a dirty scheduler thread for the script's duration** —
+  so bound concurrency / pool sessions (the durable consequence from §2b).
 - Design the handler contract to mirror `ExBashkit.Sandbox`-style dispatch.
 
 ### Phase 7 — Optional embedded interpreters
