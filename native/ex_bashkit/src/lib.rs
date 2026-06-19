@@ -11,7 +11,7 @@ use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use bashkit::{FileSystem, RealFs, RealFsMode};
+use bashkit::{ExecutionLimits, FileSystem, RealFs, RealFsMode};
 use rustler::{Binary, Encoder, Env, NifResult, OwnedBinary, Resource, ResourceArc, Term};
 use tokio::runtime::Runtime;
 
@@ -108,6 +108,63 @@ fn exec(env: Env<'_>, script: String) -> NifResult<Term<'_>> {
     Ok(encode_exec_result(env, result))
 }
 
+/// Decode an Elixir `:limits` map into `ExecutionLimits`, applying only the keys
+/// present (others keep bashkit's defaults). Returns `None` when no limits were
+/// given, so the caller skips `.limits()` entirely. Values are pre-validated on
+/// the Elixir side (known keys, non-negative integers), so missing/ill-typed
+/// keys are simply ignored here.
+fn decode_limits<'a>(env: Env<'a>, limits: Term<'a>) -> Option<ExecutionLimits> {
+    if !limits.is_map() {
+        return None;
+    }
+
+    let get = |key: &str| -> Option<usize> {
+        let k = rustler::types::atom::Atom::from_str(env, key)
+            .ok()?
+            .encode(env);
+        // `map_get` errors only when the key is absent -> keep bashkit's default.
+        // A value too large for `usize` means "effectively unlimited", so saturate
+        // to `usize::MAX` rather than silently dropping back to the (tighter)
+        // default — that would be the opposite of the caller's intent.
+        let term = limits.map_get(k).ok()?;
+        Some(term.decode::<usize>().unwrap_or(usize::MAX))
+    };
+
+    let mut l = ExecutionLimits::default();
+    let mut any = false;
+
+    if let Some(n) = get("max_commands") {
+        l = l.max_commands(n);
+        any = true;
+    }
+    if let Some(n) = get("max_loop_iterations") {
+        l = l.max_loop_iterations(n);
+        any = true;
+    }
+    if let Some(n) = get("max_total_loop_iterations") {
+        l = l.max_total_loop_iterations(n);
+        any = true;
+    }
+    if let Some(n) = get("max_function_depth") {
+        l = l.max_function_depth(n);
+        any = true;
+    }
+    if let Some(n) = get("max_input_bytes") {
+        l = l.max_input_bytes(n);
+        any = true;
+    }
+    if let Some(ms) = get("timeout_ms") {
+        l = l.timeout(std::time::Duration::from_millis(ms as u64));
+        any = true;
+    }
+
+    if any {
+        Some(l)
+    } else {
+        None
+    }
+}
+
 /// Encode a host-mount configuration error as `{:error, message}`.
 fn mount_error<'a>(env: Env<'a>, vfs: &str, host: &str, reason: &str) -> Term<'a> {
     let error = rustler::types::atom::error().encode(env);
@@ -125,6 +182,7 @@ fn mount_error<'a>(env: Env<'a>, vfs: &str, host: &str, reason: &str) -> Term<'a
 /// symlink-escape rejection, sensitive-path default-deny) — we only surface the
 /// common misconfiguration up front. Dirty-scheduled because wiring up the
 /// interpreter's ~150 builtins is more work than a regular NIF should do inline.
+#[allow(clippy::too_many_arguments)]
 #[rustler::nif(schedule = "DirtyCpu")]
 fn session_new<'a>(
     env: Env<'a>,
@@ -134,8 +192,13 @@ fn session_new<'a>(
     hostname: Option<String>,
     mounts: Vec<(String, String, String)>,
     allowed_mount_paths: Vec<String>,
+    limits: Term<'a>,
 ) -> Term<'a> {
     let mut builder = bashkit::Bash::builder();
+
+    if let Some(limits) = decode_limits(env, limits) {
+        builder = builder.limits(limits);
+    }
 
     if let Some(username) = username {
         builder = builder.username(username);

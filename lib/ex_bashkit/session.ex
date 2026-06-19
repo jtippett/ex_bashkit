@@ -40,6 +40,8 @@ defmodule ExBashkit.Session do
       `:read_only` or `:read_write`.
     * `:allowed_mount_paths` - a list of host paths that may be mounted even
       though they fall under a directory bashkit refuses by default (see below).
+    * `:limits` - a keyword list or map of resource limits enforced during
+      execution (see "Resource limits" below).
 
   ## Virtual filesystem
 
@@ -83,6 +85,28 @@ defmodule ExBashkit.Session do
   A misconfigured mount raises from `new/1` — unknown mode, a missing or
   non-directory host path, or a host path bashkit refuses (sensitive with no
   covering allowlist entry).
+
+  ## Resource limits
+
+  bashkit already bounds execution with safe defaults; `:limits` tightens them
+  for untrusted scripts. Each key is optional; unset keys keep bashkit's default.
+  When a script exceeds a limit, `exec/2` returns `{:error, message}`.
+
+      session = ExBashkit.Session.new(limits: [max_commands: 1_000, timeout_ms: 2_000])
+
+    * `:max_commands` - total commands a script may run (fuel; default 10,000).
+    * `:max_loop_iterations` - iterations of any single loop (default 10,000).
+    * `:max_total_loop_iterations` - iterations across all loops, defeating the
+      nested-loop multiplication trick (default 1,000,000).
+    * `:max_function_depth` - recursion depth (default 100).
+    * `:max_input_bytes` - maximum script size in bytes (default 10,000,000).
+    * `:timeout_ms` - wall-clock execution timeout in milliseconds (default
+      30,000; must be ≥ 1). Because a running script holds a dirty scheduler
+      thread for its duration, a large `:timeout_ms` under heavy concurrency can
+      starve the (bounded) dirty-CPU pool — keep it as tight as the workload allows.
+
+  Count limits must be non-negative integers (a value past the platform maximum
+  means "unlimited"); unknown keys raise `ArgumentError`.
   """
 
   alias ExBashkit.Result
@@ -100,9 +124,20 @@ defmodule ExBashkit.Session do
           | {:files, %{optional(Path.t()) => iodata()} | [{Path.t(), iodata()}]}
           | {:mounts, [{Path.t(), Path.t(), mount_mode()}]}
           | {:allowed_mount_paths, [Path.t()]}
+          | {:limits,
+             %{optional(limit_key()) => non_neg_integer()} | [{limit_key(), non_neg_integer()}]}
 
   @typedoc "Access mode for a host directory mount."
   @type mount_mode :: :read_only | :read_write
+
+  @typedoc "A resource-limit key accepted by the `:limits` option."
+  @type limit_key ::
+          :max_commands
+          | :max_loop_iterations
+          | :max_total_loop_iterations
+          | :max_function_depth
+          | :max_input_bytes
+          | :timeout_ms
 
   @doc """
   Create a new persistent session, optionally seeding its initial state.
@@ -121,9 +156,10 @@ defmodule ExBashkit.Session do
     hostname = opts |> Keyword.get(:hostname) |> normalize_string()
     mounts = opts |> Keyword.get(:mounts, []) |> normalize_mounts()
     allowed = opts |> Keyword.get(:allowed_mount_paths, []) |> Enum.map(&to_string/1)
+    limits = opts |> Keyword.get(:limits) |> normalize_limits()
 
     session =
-      case ExBashkit.Native.session_new(env, cwd, username, hostname, mounts, allowed) do
+      case ExBashkit.Native.session_new(env, cwd, username, hostname, mounts, allowed, limits) do
         {:ok, ref} -> %__MODULE__{ref: ref}
         {:error, message} -> raise ArgumentError, message
       end
@@ -208,6 +244,40 @@ defmodule ExBashkit.Session do
   @spec read_file(t(), Path.t()) :: {:ok, binary()} | {:error, String.t()}
   def read_file(%__MODULE__{ref: ref}, path) do
     ExBashkit.Native.session_read_file(ref, to_string(path))
+  end
+
+  @limit_keys ~w(max_commands max_loop_iterations max_total_loop_iterations
+                 max_function_depth max_input_bytes timeout_ms)a
+
+  # Validate and collect :limits into a plain map of known keys for the NIF.
+  defp normalize_limits(nil), do: %{}
+
+  defp normalize_limits(limits) when is_list(limits) or is_map(limits) do
+    map = Map.new(limits)
+
+    Enum.each(map, fn {key, value} ->
+      unless key in @limit_keys do
+        raise ArgumentError,
+              "unknown limit #{inspect(key)}; valid limits: #{inspect(@limit_keys)}"
+      end
+
+      unless is_integer(value) and value >= 0 do
+        raise ArgumentError,
+              "limit #{inspect(key)} must be a non-negative integer, got: #{inspect(value)}"
+      end
+    end)
+
+    # `timeout_ms: 0` would time out *every* exec immediately (even `echo hi`),
+    # unlike the count limits where 0 is a meaningful strict cap. Reject it.
+    if Map.get(map, :timeout_ms) == 0 do
+      raise ArgumentError, "limit :timeout_ms must be at least 1 (0 would time out immediately)"
+    end
+
+    map
+  end
+
+  defp normalize_limits(other) do
+    raise ArgumentError, ":limits must be a keyword list or map, got: #{inspect(other)}"
   end
 
   # Stringify each {vfs, host, mode} mount tuple for the NIF; `to_string/1`

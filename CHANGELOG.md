@@ -4,6 +4,11 @@
 
 ### Added
 
+- Resource limits. `ExBashkit.Session.new/1` accepts `:limits` (keyword list or
+  map) to tighten bashkit's execution bounds for untrusted scripts:
+  `:max_commands`, `:max_loop_iterations`, `:max_total_loop_iterations`,
+  `:max_function_depth`, `:max_input_bytes`, and `:timeout_ms`. Exceeding a limit
+  returns `{:error, message}`; unknown keys or non-integer values raise.
 - Host directory mounts. `ExBashkit.Session.new/1` accepts `:mounts` —
   `{vfs_path, host_path, mode}` tuples (`:read_only` / `:read_write`) — mapping
   real host directories into a sandbox, plus `:allowed_mount_paths` to opt into

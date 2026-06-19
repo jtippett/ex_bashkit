@@ -138,6 +138,22 @@ needs an allowlist entry. A refused or misconfigured mount raises from `new/1`.
 > supported: bashkit has no real-FS overlay mode, and ExBashkit only exposes what
 > bashkit does. For copy-on-write behavior, use the in-memory filesystem.
 
+## Resource limits
+
+bashkit bounds execution with safe defaults; tighten them per session for
+untrusted scripts. Exceeding a limit returns `{:error, message}`.
+
+```elixir
+session = ExBashkit.Session.new(limits: [max_commands: 1_000, timeout_ms: 2_000])
+
+ExBashkit.Session.exec(session, "for i in {1..1000000}; do :; done")
+# => {:error, "resource limit exceeded: maximum command count exceeded (1000)"}
+```
+
+Available limits: `:max_commands`, `:max_loop_iterations`,
+`:max_total_loop_iterations`, `:max_function_depth`, `:max_input_bytes`,
+`:timeout_ms`. Each is optional and defaults to bashkit's value.
+
 ## Why a virtual bash?
 
 | | Real `System.cmd/3` | ExBashkit |
@@ -160,8 +176,8 @@ for its optional `python` builtin.
   escape rejection, and a sensitive-path default-deny enforced by bashkit.
 - **Processes:** none. All commands are reimplemented Rust builtins.
 - **Network:** off by default; opt-in per-domain allowlist (planned).
-- **Resource limits:** command count, loop iterations, output size, recursion
-  depth (planned to be exposed; enforced in bashkit today).
+- **Resource limits:** command count, loop iterations, recursion depth, input
+  size, and a wall-clock timeout — tunable per session via `:limits`.
 - **Isolation:** each `exec/1` runs in an independent sandbox; a
   `Session` is an independent sandbox that persists across its own calls.
 
@@ -189,7 +205,7 @@ See [`PORTING.md`](PORTING.md) for the staged plan. In brief:
 2. ✅ Persistent sessions (state across calls)
 3. ✅ Virtual filesystem — in-memory seed/read/write, plus `:read_only` /
    `:read_write` host-directory mounts
-4. ◻ Resource limits
+4. ✅ Resource limits (`:limits` — commands, loops, recursion, input size, timeout)
 5. ◻ Network allowlist
 6. ◻ Elixir-defined custom builtins (call back into your app)
 7. ◻ Optional builtins: `sqlite` (Turso), `typescript` (ZapCode), `python` (monty)
