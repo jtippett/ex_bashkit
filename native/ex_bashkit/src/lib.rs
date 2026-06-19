@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use bashkit::{
     async_trait, Builtin, BuiltinContext, ExecResult, ExecutionExtensions, ExecutionLimits,
-    FileSystem, RealFs, RealFsMode,
+    FileSystem, FileSystemExt, RealFs, RealFsMode,
 };
 // `NetworkAllowlist` and the `.network()` builder method are themselves gated on
 // bashkit's `http_client` feature, so our use of them must be too. We enable the
@@ -31,7 +31,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
 
 mod atoms {
-    rustler::atoms! { bashkit_call }
+    rustler::atoms! { bashkit_call, bashkit_fs, ok_bytes, ok_list, ok_stat }
 }
 
 /// A single process-wide multi-thread tokio runtime.
@@ -77,6 +77,10 @@ fn runtime() -> &'static Runtime {
 struct SessionResource {
     bash: Mutex<bashkit::Bash>,
     fs: AssertUnwindSafe<Arc<dyn FileSystem>>,
+    /// This session's current back-call target (handler pid + timeout), shared
+    /// with every mounted `ElixirFs`. `FileSystem` methods have no execution
+    /// context, so `session_exec` publishes it here for the duration of a run.
+    fs_target: Arc<Mutex<Option<CallTarget>>>,
 }
 
 #[rustler::resource_impl]
@@ -283,6 +287,356 @@ fn builtin_reply(req_id: u64, stdout: Binary, stderr: Binary, exit_code: i32) ->
     rustler::types::atom::ok()
 }
 
+// --- Elixir-backed virtual filesystem (reuses the back-call bridge) ---------
+//
+// An `ElixirFs` is a `bashkit::FileSystem` mounted at a vfs path; its methods
+// back-call Elixir the same way builtins do. The one structural difference:
+// `FileSystem` methods receive only a `&Path` (no `Context`), so the per-exec
+// handler pid can't ride an execution extension — it travels via a shared
+// `Arc<Mutex<Option<CallTarget>>>` cell set by `session_exec` (safe because a
+// session's execs are serialized by the `bash` lock). Replies are heterogeneous
+// (bytes / unit / dir list / metadata), so a separate `fs_reply` NIF and table.
+
+/// A normalized reply for one virtual-filesystem operation.
+enum FsReply {
+    Unit,
+    Bytes(Vec<u8>),
+    List(Vec<(String, bool)>),
+    Stat { is_dir: bool, size: u64 },
+    Error(String),
+}
+
+/// Pending FS back-calls awaiting an Elixir reply, keyed by request id.
+fn pending_fs_calls() -> &'static Mutex<HashMap<u64, oneshot::Sender<FsReply>>> {
+    static PENDING: OnceLock<Mutex<HashMap<u64, oneshot::Sender<FsReply>>>> = OnceLock::new();
+    PENDING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// RAII cleanup for the FS pending table (see `PendingCleanup`).
+struct PendingFsCleanup(u64);
+
+impl Drop for PendingFsCleanup {
+    fn drop(&mut self) {
+        pending_fs_calls()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.0);
+    }
+}
+
+/// Build a bashkit FS error from an errno-style reason (or a free-form string).
+fn map_fs_error(reason: &str) -> bashkit::Error {
+    use std::io::ErrorKind;
+    let (kind, msg): (ErrorKind, String) = match reason {
+        "enoent" => (ErrorKind::NotFound, "No such file or directory".into()),
+        "eacces" | "eperm" => (ErrorKind::PermissionDenied, "Permission denied".into()),
+        "eexist" => (ErrorKind::AlreadyExists, "File exists".into()),
+        "eisdir" => (ErrorKind::Other, "Is a directory".into()),
+        "enotdir" => (ErrorKind::Other, "Not a directory".into()),
+        "enotsup" | "enosys" => (ErrorKind::Unsupported, "Operation not supported".into()),
+        other => (ErrorKind::Other, other.to_string()),
+    };
+    std::io::Error::new(kind, msg).into()
+}
+
+/// A bashkit error for an internal bridge failure (handler gone, timeout, …).
+fn fs_bridge_error(msg: &str) -> bashkit::Error {
+    std::io::Error::other(msg.to_string()).into()
+}
+
+/// A `FileSystem` mounted at a vfs path whose operations are serviced by Elixir.
+struct ElixirFs {
+    /// The vfs mount point (e.g. `/api`); identifies the handler's backend.
+    mount_path: String,
+    /// This session's current back-call target, set per-exec by `session_exec`.
+    target: Arc<Mutex<Option<CallTarget>>>,
+}
+
+impl ElixirFs {
+    /// Perform one back-call: send `{:bashkit_fs, req_id, mount, op, path, data,
+    /// recursive}` to the current handler and await the normalized reply.
+    async fn call(
+        &self,
+        op: &'static str,
+        path: &Path,
+        data: Vec<u8>,
+        recursive: bool,
+    ) -> bashkit::Result<FsReply> {
+        let target = (*self.target.lock().unwrap_or_else(|p| p.into_inner()))
+            .ok_or_else(|| fs_bridge_error("no active execution for this virtual filesystem"))?;
+
+        let req_id = next_request_id();
+        let (tx, rx) = oneshot::channel::<FsReply>();
+        pending_fs_calls()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(req_id, tx);
+        let _cleanup = PendingFsCleanup(req_id);
+
+        // `OwnedEnv::send_and_clear` panics on a BEAM-managed thread; send from a
+        // tokio blocking thread (same reason as builtins).
+        let handler = target.handler;
+        let mount = self.mount_path.clone();
+        let path = path.to_string_lossy().into_owned();
+        let send_outcome = tokio::task::spawn_blocking(move || {
+            let mut owned = OwnedEnv::new();
+            owned.send_and_clear(&handler, |env_| {
+                let op_atom = rustler::types::atom::Atom::from_str(env_, op)
+                    .expect("op atom")
+                    .encode(env_);
+                let data_term = match OwnedBinary::new(data.len()) {
+                    Some(mut bin) => {
+                        bin.as_mut_slice().copy_from_slice(&data);
+                        bin.release(env_).encode(env_)
+                    }
+                    None => "".encode(env_),
+                };
+                rustler::types::tuple::make_tuple(
+                    env_,
+                    &[
+                        atoms::bashkit_fs().encode(env_),
+                        req_id.encode(env_),
+                        mount.encode(env_),
+                        op_atom,
+                        path.encode(env_),
+                        data_term,
+                        recursive.encode(env_),
+                    ],
+                )
+            })
+        })
+        .await;
+
+        if !matches!(send_outcome, Ok(Ok(()))) {
+            return Err(fs_bridge_error("virtual filesystem handler is unavailable"));
+        }
+
+        match tokio::time::timeout(target.timeout, rx).await {
+            Ok(Ok(reply)) => Ok(reply),
+            Ok(Err(_)) => Err(fs_bridge_error(
+                "virtual filesystem handler stopped before replying",
+            )),
+            Err(_elapsed) => Err(fs_bridge_error("virtual filesystem operation timed out")),
+        }
+    }
+
+    /// Back-call expecting a unit (`:ok`) reply, mapping errors.
+    async fn call_unit(
+        &self,
+        op: &'static str,
+        path: &Path,
+        data: Vec<u8>,
+        recursive: bool,
+    ) -> bashkit::Result<()> {
+        match self.call(op, path, data, recursive).await? {
+            FsReply::Unit => Ok(()),
+            FsReply::Error(reason) => Err(map_fs_error(&reason)),
+            _ => Err(fs_bridge_error("virtual filesystem: unexpected reply")),
+        }
+    }
+}
+
+fn is_mount_root(path: &Path) -> bool {
+    let p = path.as_os_str();
+    p.is_empty() || p == "/"
+}
+
+fn dir_metadata() -> bashkit::Metadata {
+    bashkit::Metadata {
+        file_type: bashkit::FileType::Directory,
+        mode: 0o755,
+        ..Default::default()
+    }
+}
+
+// `FileSystem` requires `FileSystemExt`; all its methods (usage/limits/mkfifo/
+// snapshot/…) have sensible defaults, so an empty impl is enough.
+impl FileSystemExt for ElixirFs {}
+
+#[async_trait]
+impl FileSystem for ElixirFs {
+    async fn read_file(&self, path: &Path) -> bashkit::Result<Vec<u8>> {
+        match self.call("read", path, Vec::new(), false).await? {
+            FsReply::Bytes(bytes) => Ok(bytes),
+            FsReply::Error(reason) => Err(map_fs_error(&reason)),
+            _ => Err(fs_bridge_error(
+                "virtual filesystem: unexpected reply for read",
+            )),
+        }
+    }
+
+    async fn write_file(&self, path: &Path, content: &[u8]) -> bashkit::Result<()> {
+        self.call_unit("write", path, content.to_vec(), false).await
+    }
+
+    async fn append_file(&self, path: &Path, content: &[u8]) -> bashkit::Result<()> {
+        self.call_unit("append", path, content.to_vec(), false)
+            .await
+    }
+
+    async fn mkdir(&self, path: &Path, recursive: bool) -> bashkit::Result<()> {
+        self.call_unit("mkdir", path, Vec::new(), recursive).await
+    }
+
+    async fn remove(&self, path: &Path, recursive: bool) -> bashkit::Result<()> {
+        self.call_unit("remove", path, Vec::new(), recursive).await
+    }
+
+    async fn stat(&self, path: &Path) -> bashkit::Result<bashkit::Metadata> {
+        if is_mount_root(path) {
+            return Ok(dir_metadata());
+        }
+        match self.call("stat", path, Vec::new(), false).await? {
+            FsReply::Stat { is_dir, size } => Ok(bashkit::Metadata {
+                file_type: if is_dir {
+                    bashkit::FileType::Directory
+                } else {
+                    bashkit::FileType::File
+                },
+                size,
+                mode: if is_dir { 0o755 } else { 0o644 },
+                ..Default::default()
+            }),
+            FsReply::Error(reason) => Err(map_fs_error(&reason)),
+            _ => Err(fs_bridge_error(
+                "virtual filesystem: unexpected reply for stat",
+            )),
+        }
+    }
+
+    async fn read_dir(&self, path: &Path) -> bashkit::Result<Vec<bashkit::DirEntry>> {
+        match self.call("list", path, Vec::new(), false).await? {
+            FsReply::List(entries) => Ok(entries
+                .into_iter()
+                .map(|(name, is_dir)| bashkit::DirEntry {
+                    name,
+                    metadata: bashkit::Metadata {
+                        file_type: if is_dir {
+                            bashkit::FileType::Directory
+                        } else {
+                            bashkit::FileType::File
+                        },
+                        ..Default::default()
+                    },
+                })
+                .collect()),
+            FsReply::Error(reason) => Err(map_fs_error(&reason)),
+            _ => Err(fs_bridge_error(
+                "virtual filesystem: unexpected reply for list",
+            )),
+        }
+    }
+
+    async fn exists(&self, path: &Path) -> bashkit::Result<bool> {
+        if is_mount_root(path) {
+            return Ok(true);
+        }
+        // Derive existence from stat; ENOENT means "no", other errors propagate.
+        match self.call("stat", path, Vec::new(), false).await? {
+            FsReply::Stat { .. } => Ok(true),
+            FsReply::Error(reason) if reason == "enoent" => Ok(false),
+            FsReply::Error(reason) => Err(map_fs_error(&reason)),
+            _ => Err(fs_bridge_error(
+                "virtual filesystem: unexpected reply for exists",
+            )),
+        }
+    }
+
+    async fn rename(&self, _from: &Path, _to: &Path) -> bashkit::Result<()> {
+        Err(unsupported_vfs_op())
+    }
+
+    async fn copy(&self, _from: &Path, _to: &Path) -> bashkit::Result<()> {
+        Err(unsupported_vfs_op())
+    }
+
+    async fn symlink(&self, _target: &Path, _link: &Path) -> bashkit::Result<()> {
+        Err(unsupported_vfs_op())
+    }
+
+    async fn read_link(&self, _path: &Path) -> bashkit::Result<std::path::PathBuf> {
+        Err(unsupported_vfs_op())
+    }
+
+    async fn chmod(&self, _path: &Path, _mode: u32) -> bashkit::Result<()> {
+        // chmod is meaningless on virtual files; succeed silently so scripts that
+        // chmod (e.g. after writing) don't spuriously fail.
+        Ok(())
+    }
+}
+
+fn unsupported_vfs_op() -> bashkit::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "operation not supported on a virtual filesystem",
+    )
+    .into()
+}
+
+/// Decode an Elixir-normalized FS reply term into an `FsReply`. The handler
+/// guarantees one of: `:ok` | `{:ok_bytes, bin}` | `{:ok_list, [{bin, bool}]}` |
+/// `{:ok_stat, is_dir, size}` | `{:error, reason_bin}`. Anything else is a bug
+/// surfaced as an I/O error rather than a panic.
+fn decode_fs_reply(reply: Term<'_>) -> FsReply {
+    if let Ok(atom) = reply.decode::<rustler::Atom>() {
+        if atom == rustler::types::atom::ok() {
+            return FsReply::Unit;
+        }
+        return FsReply::Error("eio".into());
+    }
+
+    let Ok(tuple) = rustler::types::tuple::get_tuple(reply) else {
+        return FsReply::Error("eio".into());
+    };
+    let Some(tag) = tuple.first().and_then(|t| t.decode::<rustler::Atom>().ok()) else {
+        return FsReply::Error("eio".into());
+    };
+
+    if tag == atoms::ok_bytes() {
+        match tuple.get(1).and_then(|t| t.decode::<Binary>().ok()) {
+            Some(bin) => FsReply::Bytes(bin.as_slice().to_vec()),
+            None => FsReply::Error("eio".into()),
+        }
+    } else if tag == atoms::ok_list() {
+        match tuple
+            .get(1)
+            .and_then(|t| t.decode::<Vec<(String, bool)>>().ok())
+        {
+            Some(entries) => FsReply::List(entries),
+            None => FsReply::Error("eio".into()),
+        }
+    } else if tag == atoms::ok_stat() {
+        match (
+            tuple.get(1).and_then(|t| t.decode::<bool>().ok()),
+            tuple.get(2).and_then(|t| t.decode::<u64>().ok()),
+        ) {
+            (Some(is_dir), Some(size)) => FsReply::Stat { is_dir, size },
+            _ => FsReply::Error("eio".into()),
+        }
+    } else if tag == rustler::types::atom::error() {
+        match tuple.get(1).and_then(|t| t.decode::<String>().ok()) {
+            Some(reason) => FsReply::Error(reason),
+            None => FsReply::Error("eio".into()),
+        }
+    } else {
+        FsReply::Error("eio".into())
+    }
+}
+
+/// Deliver an Elixir handler's reply for one FS back-call (see `builtin_reply`).
+#[rustler::nif]
+fn fs_reply(req_id: u64, reply: Term<'_>) -> rustler::Atom {
+    let decoded = decode_fs_reply(reply);
+    if let Some(tx) = pending_fs_calls()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&req_id)
+    {
+        let _ = tx.send(decoded);
+    }
+    rustler::types::atom::ok()
+}
+
 /// Encode a bashkit run as `{:ok, {stdout, stderr, exit_code}}`, or an
 /// interpreter/parse error as `{:error, message}`. Shared by the stateless and
 /// session execution paths so both marshal results identically.
@@ -465,6 +819,7 @@ fn session_new<'a>(
     limits: Term<'a>,
     network: Term<'a>,
     builtin_names: Vec<String>,
+    virtual_fs_paths: Vec<String>,
 ) -> Term<'a> {
     let mut builder = bashkit::Bash::builder();
 
@@ -531,6 +886,22 @@ fn session_new<'a>(
     // read/write route through the same (possibly layered) FS scripts use.
     let fs = bash.fs();
 
+    // Mount each Elixir-backed virtual filesystem at its vfs path. They share the
+    // per-exec `fs_target` cell (the FS trait has no execution context to read a
+    // handler pid from); `session_exec` publishes the current target into it.
+    let fs_target: Arc<Mutex<Option<CallTarget>>> = Arc::new(Mutex::new(None));
+    for path in &virtual_fs_paths {
+        let elixir_fs = ElixirFs {
+            mount_path: path.clone(),
+            target: Arc::clone(&fs_target),
+        };
+        if let Err(e) = bash.mount(path, Arc::new(elixir_fs)) {
+            let error = rustler::types::atom::error().encode(env);
+            let msg = format!("virtual_fs mount {path:?}: {e}").encode(env);
+            return rustler::types::tuple::make_tuple(env, &[error, msg]);
+        }
+    }
+
     // bashkit *silently skips* mounts it refuses (a sensitive host path with no
     // covering allowlist entry, an invalid mount point, or a dir removed since
     // validation) — it only warns on stderr. Verify each mount point now exists,
@@ -556,6 +927,7 @@ fn session_new<'a>(
     let session = ResourceArc::new(SessionResource {
         bash: Mutex::new(bash),
         fs: AssertUnwindSafe(fs),
+        fs_target,
     });
 
     let ok = rustler::types::atom::ok().encode(env);
@@ -595,7 +967,16 @@ fn session_exec<'a>(
     };
     let extensions = ExecutionExtensions::new().with(target);
 
+    // Publish the target so any mounted `ElixirFs` can reach this exec's handler
+    // (FS methods have no execution context). Cleared after the run so no stale
+    // pid lingers. Safe to mutate without the `bash` lock's help because we hold
+    // it — this session's execs are serialized.
+    *session.fs_target.lock().unwrap_or_else(|p| p.into_inner()) = Some(target);
+
     let result = runtime().block_on(async { bash.exec_with_extensions(&script, extensions).await });
+
+    *session.fs_target.lock().unwrap_or_else(|p| p.into_inner()) = None;
+
     encode_exec_result(env, result)
 }
 

@@ -204,6 +204,34 @@ exit 0), `{:error, iodata}` (stderr, exit 1), or a full `%ExBashkit.Result{}`. A
 handler that raises or exceeds `:builtin_timeout_ms` fails only that command, not
 the session.
 
+## Virtual filesystem backends
+
+Mount an **Elixir-backed filesystem** at a path: the script's reads and writes
+under it are serviced by your application, so "files" can be generated on demand
+or proxied to a real store. A backend is a module implementing the
+`ExBashkit.VirtualFs` behaviour (as `module` or `{module, arg}`), or a single
+dispatch function for inline use.
+
+```elixir
+session =
+  ExBashkit.Session.new(
+    virtual_fs: %{
+      "/api" => fn
+        %{op: :read, path: "/" <> name} -> {:ok, "generated: #{name}\n"}
+        _ -> {:error, :enotsup}
+      end
+    }
+  )
+
+ExBashkit.Session.exec(session, "cat /api/widget")
+# => {:ok, %ExBashkit.Result{stdout: "generated: widget\n", exit_code: 0}}
+```
+
+Reads and writes are both supported (`read`/`write`/`append`/`mkdir`/`remove`/
+`list`/`stat`); paths arrive rooted at the mount. It composes with the in-memory
+FS, `:files`, and host `:mounts`, and reuses the same back-call machinery (and
+failure isolation) as custom builtins.
+
 ## Why a virtual bash?
 
 | | Real `System.cmd/3` | ExBashkit |
@@ -259,7 +287,7 @@ See [`PORTING.md`](PORTING.md) for the staged plan. In brief:
 4. ✅ Resource limits (`:limits` — commands, loops, recursion, input size, timeout)
 5. ✅ Network allowlist (`:allow_net` — default-deny per-URL, SSRF protection)
 6. ✅ Elixir-defined custom builtins (`:builtins` — call back into your app)
-7. ◻ Dynamic Elixir-backed filesystem (same back-call bridge as custom builtins)
+7. ✅ Dynamic Elixir-backed filesystem (`:virtual_fs` — same back-call bridge)
 8. ◻ Optional builtins: `sqlite` (Turso), `typescript` (ZapCode), `python` (monty)
 9. ◻ Snapshot / resume
 10. ◻ LLM tool contract helpers

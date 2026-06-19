@@ -168,7 +168,7 @@ Pause/resume *is* possible (phase 8), and serialization patterns from ExMonty's
 Each phase: implement the NIF(s), add the Elixir API + struct, write tests
 (`EXBASHKIT_BUILD=1 mix test`), update README + CHANGELOG, keep CI green.
 
-> **Status (Phases 1–6 shipped to `master`, CI green; 98 tests).** Everything
+> **Status (Phases 1–6b shipped to `master`, CI green; 117 tests).** Everything
 > below the line is built. The per-phase loop that's working: TDD (write the
 > failing test first) → implement → full gate (`mix test` + `mix format` +
 > `cargo fmt` + `cargo clippy -D warnings`) → dispatch the `superpowers:code-reviewer`
@@ -265,13 +265,33 @@ Hard-won specifics (don't re-derive):
 - Handler process is `spawn_link`ed then `unlink`+`:kill`ed on teardown (in an
   `after`) — orphan-safe if the caller dies, and the kill never reaches the caller.
 
-### Phase 6b — Dynamic Elixir-backed filesystem (next, reuses the bridge)
-`FileSystem` is a trait with `async` `read_file`/`write_file`/`read_dir`/`exists`/
-`mkdir`/… Implement a backend that proxies to Elixir so files are generated on
-demand. Reuses the exact back-call machinery from Phase 6 (the `req_id` table,
-`builtin_reply`-style delivery, per-exec handler pid, `PendingCleanup`) — but
-across ~6 methods on the FS hot path, so mind per-call cost and the same
-no-reentrancy rule. Required feature, just sequenced after builtins.
+### Phase 6b — Dynamic Elixir-backed filesystem ✅
+Done. `Session.new(virtual_fs: %{"/api" => spec})` mounts an Elixir-backed
+`bashkit::FileSystem` (`ElixirFs`) via `Bash::mount` post-build. `spec` is a
+1-arity fn, a module implementing the new **`ExBashkit.VirtualFs`** behaviour, or
+`{module, arg}` (the José/Sasa-blessed Plug-style dual — see the design doc).
+Read **and** write: read/write/append/mkdir/remove/list/stat forwarded; `exists`
+derived from stat; root `/` is a dir without a back-call; chmod no-op;
+rename/copy/symlink/read_link → unsupported. Reuses the Phase 6 bridge. Design +
+contract: **`docs/plans/2026-06-19-virtual-filesystem-design.md`** and the
+`ExBashkit.VirtualFs` moduledoc (which carries the worked examples).
+
+Hard-won specifics (don't re-derive):
+- **FS methods get only `&Path`, no `Context`** — so the per-exec handler pid
+  can't ride an execution extension like builtins do. It travels via a shared
+  `Arc<Mutex<Option<CallTarget>>>` cell on `SessionResource`, set before /
+  cleared after the run in `session_exec` (sound because a session's execs are
+  serialized by the `bash` lock; concurrent *sessions* each own their cell).
+- Separate `pending_fs_calls` table + `fs_reply` NIF + `PendingFsCleanup` (the
+  same cancellation-leak guard as builtins — bashkit's `:timeout_ms` still drops
+  the future mid-back-call).
+- `fs_errors` constructors are NOT re-exported at the crate root, so FS errors are
+  built from `std::io::Error::new(kind, msg).into()` (`crate::Error: From<io::Error>`).
+  bashkit prefixes them with `io error:` but the POSIX phrase survives.
+- The derived-`stat`-from-`read` default uses `with` (not `case`) so a total
+  `read/2` backend doesn't trip the 1.20 type checker's dead-clause warning.
+
+### Phase 6c (later) — proxy rename/copy/symlink across virtual mounts; streaming.
 
 ### Phase 7 — Optional embedded interpreters
 - `sqlite` (Turso), `typescript` (ZapCode), `python` (monty — **git-dep

@@ -4,6 +4,18 @@
 
 ### Added
 
+- Elixir-backed virtual filesystems. `ExBashkit.Session.new/1` accepts
+  `:virtual_fs` — a map of `mount_path => backend` mounting filesystems whose
+  reads and writes a script performs under that path are serviced by your
+  application (generate content on demand, proxy to a real store). A backend is a
+  module implementing the new `ExBashkit.VirtualFs` behaviour (as `module` or
+  `{module, arg}`), or a single dispatch function for inline use. Read **and**
+  write are supported (`read`/`write`/`append`/`mkdir`/`remove`/`list`/`stat`,
+  returning tagged results); `exists` is derived from `stat`, the mount root is a
+  directory, `chmod` is a no-op, and `rename`/`copy`/`symlink`/`read_link` are not
+  yet proxied. Reuses the custom-builtin back-call bridge (same handler process,
+  `:builtin_timeout_ms`, failure isolation, and no-reentrancy rule); composes
+  with the in-memory FS, `:files`, and host `:mounts`.
 - Custom builtins. `ExBashkit.Session.new/1` accepts `:builtins` — a map of
   `name => fun` registering Elixir-defined virtual executables a script invokes
   as `name args…`. Each builtin is a 1-arity function receiving `%{args, stdin,

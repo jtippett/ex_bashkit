@@ -40,7 +40,8 @@ defmodule ExBashkit.Native do
         _allowed_mount_paths,
         _limits,
         _network,
-        _builtin_names
+        _builtin_names,
+        _virtual_fs_paths
       ),
       do: :erlang.nif_error(:nif_not_loaded)
 
@@ -54,4 +55,8 @@ defmodule ExBashkit.Native do
   # builtin (see ExBashkit.Session back-call handler).
   def builtin_reply(_req_id, _stdout, _stderr, _exit_code),
     do: :erlang.nif_error(:nif_not_loaded)
+
+  # Delivers an Elixir virtual-filesystem handler's normalized reply back into
+  # the waiting Rust FS operation.
+  def fs_reply(_req_id, _reply), do: :erlang.nif_error(:nif_not_loaded)
 end

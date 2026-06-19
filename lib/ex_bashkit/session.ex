@@ -50,7 +50,11 @@ defmodule ExBashkit.Session do
     * `:builtins` - a map of `name => fun` registering Elixir-defined virtual
       executables a script can invoke (see "Custom builtins" below).
     * `:builtin_timeout_ms` - how long a single custom-builtin back-call may run
-      before it is abandoned (positive integer, default `30_000`).
+      before it is abandoned (positive integer, default `30_000`). Also bounds
+      `:virtual_fs` back-calls.
+    * `:virtual_fs` - a map of `mount_path => backend` mounting Elixir-backed
+      filesystems whose reads and writes are serviced by your application (see
+      "Virtual filesystem backends" below and `ExBashkit.VirtualFs`).
 
   ## Virtual filesystem
 
@@ -188,18 +192,51 @@ defmodule ExBashkit.Session do
   Driving a *different* session from inside a builtin is fine. Each `exec/2`
   services back-calls from a short-lived process, so builtins run outside the
   caller's process and must not rely on its process dictionary or `self()`.
+
+  ## Virtual filesystem backends
+
+  `:virtual_fs` mounts an **Elixir-backed filesystem** at a vfs path: a script's
+  reads and writes under that path are serviced by your application, so "files"
+  can be generated on demand or proxied to a real store. It composes with the
+  in-memory FS, `:files`, and host `:mounts`.
+
+      session =
+        ExBashkit.Session.new(
+          virtual_fs: %{
+            "/api" => fn
+              %{op: :read, path: path} -> {:ok, render(path)}
+              _ -> {:error, :enotsup}
+            end
+          }
+        )
+
+      {:ok, %ExBashkit.Result{stdout: out}} =
+        ExBashkit.Session.exec(session, "cat /api/users/1.json")
+
+  A backend is a `t:virtual_fs_spec/0` — a module implementing `ExBashkit.VirtualFs`,
+  a `{module, arg}` pair, or a single dispatch function for inline use. Paths
+  arrive **rooted at the mount**. The same failure model and
+  `:builtin_timeout_ms` as custom builtins apply, and the same no-reentrancy
+  rule. See `ExBashkit.VirtualFs` for the full contract.
   """
 
   alias ExBashkit.Result
 
   @enforce_keys [:ref]
-  defstruct [:ref, builtins: %{}, builtin_timeout_ms: 30_000]
+  defstruct [:ref, builtins: %{}, builtin_timeout_ms: 30_000, virtual_fs: %{}]
 
   @opaque t :: %__MODULE__{
             ref: reference(),
             builtins: %{optional(String.t()) => (map() -> term())},
-            builtin_timeout_ms: pos_integer()
+            builtin_timeout_ms: pos_integer(),
+            virtual_fs: %{optional(String.t()) => virtual_fs_spec()}
           }
+
+  @typedoc """
+  A virtual-filesystem backend for one mount: a 1-arity function, a module
+  implementing `ExBashkit.VirtualFs`, or `{module, arg}`.
+  """
+  @type virtual_fs_spec :: (map() -> term()) | module() | {module(), term()}
 
   @type option ::
           {:env, %{optional(String.t() | atom()) => String.t()} | keyword()}
@@ -215,6 +252,7 @@ defmodule ExBashkit.Session do
           | {:block_private_ips, boolean()}
           | {:builtins, %{optional(String.t()) => (map() -> term())}}
           | {:builtin_timeout_ms, pos_integer()}
+          | {:virtual_fs, %{optional(Path.t()) => virtual_fs_spec()}}
 
   @typedoc "Access mode for a host directory mount."
   @type mount_mode :: :read_only | :read_write
@@ -252,6 +290,8 @@ defmodule ExBashkit.Session do
     builtin_timeout_ms =
       opts |> Keyword.get(:builtin_timeout_ms, 30_000) |> normalize_builtin_timeout()
 
+    virtual_fs = opts |> Keyword.get(:virtual_fs, %{}) |> normalize_virtual_fs()
+
     session =
       case ExBashkit.Native.session_new(
              env,
@@ -262,10 +302,16 @@ defmodule ExBashkit.Session do
              allowed,
              limits,
              network,
-             Map.keys(builtins)
+             Map.keys(builtins),
+             Map.keys(virtual_fs)
            ) do
         {:ok, ref} ->
-          %__MODULE__{ref: ref, builtins: builtins, builtin_timeout_ms: builtin_timeout_ms}
+          %__MODULE__{
+            ref: ref,
+            builtins: builtins,
+            builtin_timeout_ms: builtin_timeout_ms,
+            virtual_fs: virtual_fs
+          }
 
         {:error, message} ->
           raise ArgumentError, message
@@ -292,9 +338,17 @@ defmodule ExBashkit.Session do
       "/tmp\\n"
   """
   @spec exec(t(), String.t()) :: {:ok, Result.t()} | {:error, String.t()}
-  def exec(%__MODULE__{ref: ref, builtins: builtins, builtin_timeout_ms: timeout}, script)
+  def exec(
+        %__MODULE__{
+          ref: ref,
+          builtins: builtins,
+          builtin_timeout_ms: timeout,
+          virtual_fs: virtual_fs
+        },
+        script
+      )
       when is_binary(script) do
-    {handler, cleanup} = start_builtin_handler(builtins)
+    {handler, cleanup} = start_handler(builtins, virtual_fs)
 
     try do
       case ExBashkit.Native.session_exec(ref, script, handler, timeout) do
@@ -323,6 +377,10 @@ defmodule ExBashkit.Session do
   If `path` falls under a `:read_write` host mount, the write reaches the **real
   host disk** (and fails under a `:read_only` mount), just as it would for a script.
 
+  This targets the in-memory and host-mount filesystem; it is not the way to feed
+  a `:virtual_fs` mount (those are driven by your backend, only while a script
+  runs). A path under a `:virtual_fs` mount returns `{:error, _}` here.
+
   ## Examples
 
       iex> session = ExBashkit.Session.new()
@@ -346,7 +404,8 @@ defmodule ExBashkit.Session do
 
   As with `write_file/3`, `path` is resolved from the filesystem **root**,
   independent of the session's working directory; pass absolute paths. A `path`
-  under a host mount reads the **real host file**.
+  under a host mount reads the **real host file**; a path under a `:virtual_fs`
+  mount is not serviced here and returns `{:error, _}`.
 
   ## Examples
 
@@ -418,19 +477,20 @@ defmodule ExBashkit.Session do
     raise ArgumentError, ":block_private_ips must be true or false, got: #{inspect(other)}"
   end
 
-  # --- custom builtin back-call handling ------------------------------------
+  # --- back-call handling (custom builtins + virtual filesystems) -----------
 
-  # A session with no custom builtins needs no handler process; the pid we hand
-  # the NIF is never used (no builtin can fire), so the caller's own pid is fine.
-  defp start_builtin_handler(builtins) when map_size(builtins) == 0 do
+  # With neither builtins nor virtual filesystems there can be no back-call, so
+  # no handler process is needed; the pid we hand the NIF is never used.
+  defp start_handler(builtins, virtual_fs)
+       when map_size(builtins) == 0 and map_size(virtual_fs) == 0 do
     {self(), fn -> :ok end}
   end
 
   # Otherwise spawn a short-lived process to service back-calls for the duration
   # of one `exec/2`. It is linked so it dies with the caller (no orphan), and we
   # unlink-then-kill on teardown so our own kill never propagates to the caller.
-  defp start_builtin_handler(builtins) do
-    pid = spawn_link(fn -> builtin_handler_loop(builtins) end)
+  defp start_handler(builtins, virtual_fs) do
+    pid = spawn_link(fn -> handler_loop(builtins, virtual_fs) end)
 
     cleanup = fn ->
       Process.unlink(pid)
@@ -440,12 +500,17 @@ defmodule ExBashkit.Session do
     {pid, cleanup}
   end
 
-  defp builtin_handler_loop(builtins) do
+  defp handler_loop(builtins, virtual_fs) do
     receive do
       {:bashkit_call, req_id, name, args, stdin, env_pairs} ->
         {stdout, stderr, exit_code} = invoke_builtin(builtins, name, args, stdin, env_pairs)
         ExBashkit.Native.builtin_reply(req_id, stdout, stderr, exit_code)
-        builtin_handler_loop(builtins)
+        handler_loop(builtins, virtual_fs)
+
+      {:bashkit_fs, req_id, mount, op, path, data, recursive} ->
+        reply = invoke_fs(Map.fetch!(virtual_fs, mount), op, path, data, recursive)
+        ExBashkit.Native.fs_reply(req_id, reply)
+        handler_loop(builtins, virtual_fs)
     end
   end
 
@@ -511,6 +576,117 @@ defmodule ExBashkit.Session do
   defp normalize_builtin_timeout(other) do
     raise ArgumentError, ":builtin_timeout_ms must be a positive integer, got: #{inspect(other)}"
   end
+
+  # --- virtual filesystem back-call handling --------------------------------
+
+  # Run one FS operation against a mount's backend and normalize its return into
+  # the wire reply the `fs_reply` NIF decodes. A raise/throw/bad-shape becomes an
+  # `{:error, _}` for that op — never a crashed handler or a wedged session.
+  defp invoke_fs(spec, op, path, data, recursive) do
+    spec
+    |> dispatch_fs(op, path, data, recursive)
+    |> normalize_fs_reply(op)
+  rescue
+    e -> {:error, "#{op}: #{Exception.message(e)}"}
+  catch
+    kind, reason -> {:error, "#{op}: #{kind} #{inspect(reason)}"}
+  end
+
+  defp dispatch_fs(fun, op, path, data, recursive) when is_function(fun, 1) do
+    fun.(fs_request(op, path, data, recursive))
+  end
+
+  defp dispatch_fs({module, arg}, op, path, data, recursive) do
+    fs_apply(module, arg, op, path, data, recursive)
+  end
+
+  defp dispatch_fs(module, op, path, data, recursive) when is_atom(module) do
+    fs_apply(module, nil, op, path, data, recursive)
+  end
+
+  defp fs_request(:write, path, data, _r), do: %{op: :write, path: path, data: data}
+  defp fs_request(:append, path, data, _r), do: %{op: :append, path: path, data: data}
+
+  defp fs_request(:mkdir, path, _d, recursive),
+    do: %{op: :mkdir, path: path, recursive: recursive}
+
+  defp fs_request(:remove, path, _d, recursive),
+    do: %{op: :remove, path: path, recursive: recursive}
+
+  defp fs_request(op, path, _d, _r), do: %{op: op, path: path}
+
+  defp fs_apply(m, arg, :read, path, _d, _r), do: m.read(arg, path)
+  defp fs_apply(m, arg, :write, path, data, _r), do: m.write(arg, path, data)
+  defp fs_apply(m, arg, :append, path, data, _r), do: m.append(arg, path, data)
+  defp fs_apply(m, arg, :mkdir, path, _d, recursive), do: m.mkdir(arg, path, recursive)
+  defp fs_apply(m, arg, :remove, path, _d, recursive), do: m.remove(arg, path, recursive)
+  defp fs_apply(m, arg, :list, path, _d, _r), do: m.list(arg, path)
+  defp fs_apply(m, arg, :stat, path, _d, _r), do: m.stat(arg, path)
+
+  # Canonical wire replies decoded by the `fs_reply` NIF:
+  #   :ok | {:ok_bytes, bin} | {:ok_list, [{name, is_dir?}]} | {:ok_stat, is_dir?, size}
+  #   | {:error, reason_string}
+  defp normalize_fs_reply(:ok, _op), do: :ok
+  defp normalize_fs_reply({:ok, content}, :read), do: {:ok_bytes, IO.iodata_to_binary(content)}
+
+  defp normalize_fs_reply({:ok, entries}, :list) when is_list(entries),
+    do: {:ok_list, Enum.map(entries, &fs_entry/1)}
+
+  defp normalize_fs_reply({:ok, %{type: type, size: size}}, :stat)
+       when type in [:file, :dir] and is_integer(size) and size >= 0,
+       do: {:ok_stat, type == :dir, size}
+
+  defp normalize_fs_reply({:error, reason}, _op), do: {:error, fs_reason(reason)}
+
+  defp normalize_fs_reply(other, op),
+    do: {:error, "#{op}: backend returned an invalid value: #{inspect(other)}"}
+
+  defp fs_entry(name) when is_binary(name), do: {name, false}
+  defp fs_entry({name, :dir}), do: {to_string(name), true}
+  defp fs_entry({name, :file}), do: {to_string(name), false}
+  defp fs_entry({name, _other}), do: {to_string(name), false}
+
+  defp fs_reason(reason) when is_atom(reason), do: Atom.to_string(reason)
+  defp fs_reason(reason) when is_binary(reason), do: reason
+  defp fs_reason(reason), do: inspect(reason)
+
+  # Validate the :virtual_fs map: absolute non-root mount paths => a 1-arity
+  # function, a module, or a {module, arg} tuple.
+  defp normalize_virtual_fs(virtual_fs) when is_map(virtual_fs) or is_list(virtual_fs) do
+    Map.new(virtual_fs, fn {path, spec} ->
+      path = to_string(path)
+
+      unless String.starts_with?(path, "/") and path != "/" do
+        raise ArgumentError,
+              ":virtual_fs mount path must be an absolute path other than \"/\", " <>
+                "got: #{inspect(path)}"
+      end
+
+      unless valid_fs_spec?(spec) do
+        raise ArgumentError,
+              ":virtual_fs backend for #{inspect(path)} must be a 1-arity function, a module, " <>
+                "or {module, arg}, got: #{inspect(spec)}"
+      end
+
+      {path, spec}
+    end)
+  end
+
+  defp normalize_virtual_fs(other) do
+    raise ArgumentError,
+          ":virtual_fs must be a map of mount_path => backend, got: #{inspect(other)}"
+  end
+
+  defp valid_fs_spec?(spec) when is_function(spec, 1), do: true
+  defp valid_fs_spec?({module, _arg}), do: fs_module?(module)
+  defp valid_fs_spec?(spec), do: fs_module?(spec)
+
+  # A backend module must actually exist (catches typos and rejects booleans/
+  # non-module atoms up front, rather than failing at the first back-call).
+  defp fs_module?(module) when is_atom(module) and not is_nil(module) and not is_boolean(module),
+    do: Code.ensure_loaded?(module)
+
+  defp fs_module?(_), do: false
 
   @limit_keys ~w(max_commands max_loop_iterations max_total_loop_iterations
                  max_function_depth max_input_bytes timeout_ms)a
