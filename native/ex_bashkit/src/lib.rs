@@ -133,7 +133,14 @@ fn session_exec<'a>(
     session: ResourceArc<SessionResource>,
     script: String,
 ) -> Term<'a> {
-    let mut bash = session.bash.lock().unwrap();
+    // Recover from a poisoned lock rather than bricking the session forever: if a
+    // prior `exec` panicked inside bashkit, the guard was dropped mid-unwind and
+    // poisoned this Mutex. The interpreter state is still usable, so take it back
+    // (matches ExMonty's `drive_with_mounts` recovery) instead of `unwrap`-panicking.
+    let mut bash = session
+        .bash
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let result = runtime().block_on(async { bash.exec(&script).await });
     encode_exec_result(env, result)
 }

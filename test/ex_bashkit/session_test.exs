@@ -88,5 +88,44 @@ defmodule ExBashkit.SessionTest do
       assert {:ok, %ExBashkit.Result{stderr: stderr}} = Session.exec(session, "echo oops 1>&2")
       assert stderr =~ "oops"
     end
+
+    test "a script that fails to parse returns {:error, message}" do
+      session = Session.new()
+      assert {:error, message} = Session.exec(session, ~s(echo "unterminated))
+      assert message =~ "parse error"
+    end
+
+    test "the session stays usable after a parse error and after a failing command" do
+      session = Session.new()
+      assert {:ok, _} = Session.exec(session, "export KEEP=alive")
+
+      # A parse error (returns {:error, _}) must not corrupt the session.
+      assert {:error, _} = Session.exec(session, ~s(echo "oops))
+      # A command that exits non-zero must not corrupt it either.
+      assert {:ok, %ExBashkit.Result{exit_code: 1}} = Session.exec(session, "false")
+
+      # State from before the errors is intact and the session still runs.
+      assert {:ok, %ExBashkit.Result{stdout: "alive\n"}} = Session.exec(session, "echo $KEEP")
+    end
+  end
+
+  describe "exec/2 — concurrency" do
+    test "many concurrent execs on one session all complete (the lock serializes them)" do
+      session = Session.new()
+
+      results =
+        1..25
+        |> Task.async_stream(fn i -> Session.exec(session, "echo #{i}") end,
+          max_concurrency: 25,
+          ordered: false
+        )
+        |> Enum.map(fn {:ok, res} -> res end)
+
+      assert length(results) == 25
+      assert Enum.all?(results, &match?({:ok, %ExBashkit.Result{exit_code: 0}}, &1))
+
+      outputs = for {:ok, %ExBashkit.Result{stdout: out}} <- results, do: String.trim(out)
+      assert Enum.sort(outputs, :asc) == Enum.sort(Enum.map(1..25, &to_string/1), :asc)
+    end
   end
 end
