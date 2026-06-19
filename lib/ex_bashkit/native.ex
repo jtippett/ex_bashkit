@@ -51,6 +51,11 @@ defmodule ExBashkit.Native do
   def session_read_file(_session, _path), do: :erlang.nif_error(:nif_not_loaded)
   def session_write_file(_session, _path, _content), do: :erlang.nif_error(:nif_not_loaded)
 
+  def session_snapshot(_session, _exclude_filesystem, _exclude_functions, _key),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  def session_restore(_session, _data, _key), do: :erlang.nif_error(:nif_not_loaded)
+
   # Delivers an Elixir builtin handler's result back into the waiting Rust
   # builtin (see ExBashkit.Session back-call handler).
   def builtin_reply(_req_id, _stdout, _stderr, _exit_code),

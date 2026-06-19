@@ -419,6 +419,122 @@ defmodule ExBashkit.Session do
     ExBashkit.Native.session_read_file(ref, to_string(path))
   end
 
+  @doc """
+  Capture the session's interpreter state as a binary you can persist and later
+  reload with `restore/3`.
+
+  The snapshot carries **shell state** (variables, exported env, cwd, arrays,
+  aliases, traps, and — unless excluded — functions) and the **in-memory
+  filesystem contents**. It is taken at a command boundary; there is no
+  pause-mid-command.
+
+  It does **not** carry session *configuration*: custom `:builtins`,
+  `:virtual_fs` backends, host `:mounts`, `:limits`, or network settings. Those
+  are live Elixir processes / builder config, not interpreter state. To resume,
+  build a fresh session with the **same capabilities** and `restore/3` the bytes
+  into it (see `restore/3`).
+
+  Returns `{:ok, binary}` or `{:error, message}`.
+
+  ## Options
+
+    * `:key` — a binary secret. Produces an HMAC-keyed snapshot for crossing a
+      **trust boundary** (network, shared storage, untrusted storage). Restore
+      must supply the same key; a wrong key or tampered bytes are rejected.
+      Without a key, bashkit's integrity tag detects accidental corruption only
+      (it is public, not a forgery defense).
+    * `:exclude_filesystem` — when `true`, capture shell state only (skip VFS
+      contents). Default `false`.
+    * `:exclude_functions` — when `true`, skip shell functions (avoids cloning
+      AST-backed state). Default `false`.
+
+  ## Examples
+
+      iex> session = ExBashkit.Session.new()
+      iex> {:ok, %ExBashkit.Result{}} = ExBashkit.Session.exec(session, "x=42")
+      iex> {:ok, bytes} = ExBashkit.Session.snapshot(session)
+      iex> is_binary(bytes)
+      true
+  """
+  @spec snapshot(t(), keyword()) :: {:ok, binary()} | {:error, String.t()}
+  def snapshot(%__MODULE__{ref: ref}, opts \\ []) when is_list(opts) do
+    key = snapshot_key(opts)
+
+    exclude_filesystem =
+      opts |> Keyword.get(:exclude_filesystem, false) |> truthy!(:exclude_filesystem)
+
+    exclude_functions =
+      opts |> Keyword.get(:exclude_functions, false) |> truthy!(:exclude_functions)
+
+    ExBashkit.Native.session_snapshot(ref, exclude_filesystem, exclude_functions, key)
+  end
+
+  @doc """
+  Restore previously captured state (from `snapshot/2`) into this session,
+  returning `{:ok, session}` or `{:error, message}`.
+
+  Restore overwrites the session's shell state and in-memory filesystem contents
+  while **preserving the capabilities `session` was built with** — its custom
+  `:builtins`, `:virtual_fs` backends, host `:mounts`, and `:limits` survive. The
+  intended flow is therefore:
+
+      {:ok, bytes} = ExBashkit.Session.snapshot(original)
+      # ...later, or on another node...
+      resumed = ExBashkit.Session.new(builtins: same, virtual_fs: same, limits: same)
+      {:ok, resumed} = ExBashkit.Session.restore(resumed, bytes)
+
+  bashkit validates the whole snapshot before mutating anything, so a malformed,
+  tampered, or wrong-key snapshot returns `{:error, _}` and leaves the session
+  untouched and usable. Keying is symmetric and all-or-nothing: bytes taken with
+  a `:key` must be restored with the **same** key, and plain bytes must be
+  restored without one — a mismatch is an `{:error, _}`.
+
+  ## Options
+
+    * `:key` — the binary secret the snapshot was taken with (see `snapshot/2`).
+
+  ## Examples
+
+      iex> session = ExBashkit.Session.new()
+      iex> {:ok, %ExBashkit.Result{}} = ExBashkit.Session.exec(session, "x=42")
+      iex> {:ok, bytes} = ExBashkit.Session.snapshot(session)
+      iex> fresh = ExBashkit.Session.new()
+      iex> {:ok, fresh} = ExBashkit.Session.restore(fresh, bytes)
+      iex> {:ok, result} = ExBashkit.Session.exec(fresh, "echo $x")
+      iex> result.stdout
+      "42\\n"
+  """
+  @spec restore(t(), binary(), keyword()) :: {:ok, t()} | {:error, String.t()}
+  def restore(%__MODULE__{ref: ref} = session, data, opts \\ [])
+      when is_binary(data) and is_list(opts) do
+    key = snapshot_key(opts)
+
+    case ExBashkit.Native.session_restore(ref, data, key) do
+      :ok -> {:ok, session}
+      {:error, message} -> {:error, message}
+    end
+  end
+
+  # A snapshot key, if given, must be a non-empty binary; nil means the unkeyed
+  # path. An empty key is rejected on purpose: bashkit's HMAC accepts a zero-length
+  # key, so `key: ""` would silently take the "keyed" path while providing no
+  # forgery protection at all — exactly the trust-boundary illusion this guards
+  # against (a set-but-empty env var is the classic way to hit it).
+  defp snapshot_key(opts) do
+    case Keyword.get(opts, :key) do
+      nil -> nil
+      key when is_binary(key) and byte_size(key) > 0 -> key
+      "" -> raise ArgumentError, ":key must be a non-empty binary (an empty key is not a secret)"
+      other -> raise ArgumentError, ":key must be a binary, got: #{inspect(other)}"
+    end
+  end
+
+  defp truthy!(value, _opt) when is_boolean(value), do: value
+
+  defp truthy!(value, opt) do
+    raise ArgumentError, "#{inspect(opt)} must be a boolean, got: #{inspect(value)}"
+  end
+
   # Normalize :allow_net / :block_private_ips into the plain map the NIF decodes:
   #   %{}                                         -> no network (default deny)
   #   %{allow_all: true, block_private_ips: bool} -> allow every host

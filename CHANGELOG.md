@@ -4,6 +4,19 @@
 
 ### Added
 
+- Snapshot & resume. `ExBashkit.Session.snapshot/2` captures a session's shell
+  state (variables, env, cwd, aliases, functions) and in-memory filesystem
+  contents as a binary; `ExBashkit.Session.restore/3` loads it back into a
+  session, returning `{:ok, session}` or `{:error, message}`. A snapshot carries
+  interpreter state, not session *config* — custom `:builtins`, `:virtual_fs`
+  backends, host `:mounts`, and `:limits` are live Elixir / builder config, so to
+  resume you rebuild a session with the same capabilities and restore into it
+  (restore preserves the target's capabilities and validates the whole snapshot
+  before mutating, leaving the session usable on a bad/tampered/wrong-key load).
+  `snapshot/2` options: `:key` (a non-empty binary → HMAC-keyed snapshot for
+  crossing trust boundaries; the matching key is required on restore, and a wrong
+  key or tampered bytes are rejected — without a key the embedded digest detects
+  accidental corruption only), `:exclude_filesystem`, and `:exclude_functions`.
 - Elixir-backed virtual filesystems. `ExBashkit.Session.new/1` accepts
   `:virtual_fs` — a map of `mount_path => backend` mounting filesystems whose
   reads and writes a script performs under that path are serviced by your

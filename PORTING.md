@@ -168,7 +168,7 @@ Pause/resume *is* possible (phase 8), and serialization patterns from ExMonty's
 Each phase: implement the NIF(s), add the Elixir API + struct, write tests
 (`EXBASHKIT_BUILD=1 mix test`), update README + CHANGELOG, keep CI green.
 
-> **Status (Phases 1–6b shipped to `master`, CI green; 117 tests).** Everything
+> **Status (Phases 1–6b + 8 shipped to `master`, CI green; 137 tests).** Everything
 > below the line is built. The per-phase loop that's working: TDD (write the
 > failing test first) → implement → full gate (`mix test` + `mix format` +
 > `cargo fmt` + `cargo clippy -D warnings`) → dispatch the `superpowers:code-reviewer`
@@ -300,10 +300,21 @@ Hard-won specifics (don't re-derive):
 - Note: enabling `python` makes ExBashkit a *superset* of ExMonty's Python
   surface (but without monty's fine-grained per-effect mediation).
 
-### Phase 8 — Snapshot / resume
-- `Snapshot`/`SnapshotOptions` → postcard dump/load behind a resource. Reuse
-  ExMonty `serialization.rs` patterns. Enables pausing a long script and
-  resuming later / on another node.
+### Phase 8 — Snapshot / resume ✅
+- `Session.snapshot/2` + `restore/3`. Marshals bashkit's high-level
+  `snapshot_with_options` / `restore_snapshot` (+ keyed HMAC variants). Captures
+  shell state + in-memory VFS contents; integrity-tagged (`exclude_filesystem`/
+  `exclude_functions` opts). **Config is NOT in the snapshot** (builtins,
+  virtual_fs, mounts, limits are live Elixir / builder config) → resume =
+  rebuild a same-capability session then `restore` (uses `restore_snapshot`,
+  which preserves the target's config; not `from_snapshot`, which resets it).
+  `:key` = non-empty binary → HMAC for crossing trust boundaries (wrong/missing/
+  mismatched key rejected; empty key rejected Elixir-side since bashkit's HMAC
+  accepts a zero-length key). Two `DirtyCpu` NIFs (`session_snapshot`/
+  `session_restore`), synchronous (no tokio). `MountableFs::vfs_snapshot`
+  delegates to the root in-memory fs only, so host/virtual_fs mounts aren't
+  captured (correct). Design: `docs/plans/2026-06-20-snapshot-resume-design.md`.
+  (Snapshots are command-boundary, NOT a pause-mid-effect primitive.)
 
 ### Phase 9 — LLM tool contract helpers
 - An `ExBashkit.Tool` module that emits a JSON schema + system-prompt text and

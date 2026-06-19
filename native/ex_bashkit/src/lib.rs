@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use bashkit::{
     async_trait, Builtin, BuiltinContext, ExecResult, ExecutionExtensions, ExecutionLimits,
-    FileSystem, FileSystemExt, RealFs, RealFsMode,
+    FileSystem, FileSystemExt, RealFs, RealFsMode, SnapshotOptions,
 };
 // `NetworkAllowlist` and the `.network()` builder method are themselves gated on
 // bashkit's `http_client` feature, so our use of them must be too. We enable the
@@ -1040,6 +1040,94 @@ fn session_write_file<'a>(
         }
         fs.write_file(path, &bytes).await
     });
+
+    match result {
+        Ok(()) => rustler::types::atom::ok().encode(env),
+        Err(e) => {
+            let error = rustler::types::atom::error().encode(env);
+            let msg = e.to_string().encode(env);
+            rustler::types::tuple::make_tuple(env, &[error, msg])
+        }
+    }
+}
+
+/// Capture the session's interpreter state (shell vars/env/cwd/functions plus
+/// in-memory VFS contents) as integrity-protected bytes, returning
+/// `{:ok, binary}` or `{:error, message}`.
+///
+/// `key: Some(_)` produces an HMAC-keyed snapshot for crossing trust boundaries;
+/// `None` uses bashkit's public integrity tag (corruption-detecting, not secret).
+/// The bytes do NOT carry session config (builtins, virtual_fs, mounts, limits) —
+/// resume rebuilds a session with the same capabilities, then `session_restore`s.
+/// `DirtyCpu` because serializing a large VFS can take real time, though the call
+/// itself is synchronous.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn session_snapshot<'a>(
+    env: Env<'a>,
+    session: ResourceArc<SessionResource>,
+    exclude_filesystem: bool,
+    exclude_functions: bool,
+    key: Option<Binary<'a>>,
+) -> Term<'a> {
+    let bash = session
+        .bash
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let options = SnapshotOptions {
+        exclude_filesystem,
+        exclude_functions,
+    };
+
+    let result = match key {
+        Some(key) => bash.snapshot_to_bytes_keyed_with_options(key.as_slice(), options),
+        None => bash.snapshot_with_options(options),
+    };
+
+    match result {
+        Ok(bytes) => match OwnedBinary::new(bytes.len()) {
+            Some(mut bin) => {
+                bin.as_mut_slice().copy_from_slice(&bytes);
+                let ok = rustler::types::atom::ok().encode(env);
+                let payload = bin.release(env).encode(env);
+                rustler::types::tuple::make_tuple(env, &[ok, payload])
+            }
+            None => {
+                let error = rustler::types::atom::error().encode(env);
+                let msg = "could not allocate a binary for the snapshot".encode(env);
+                rustler::types::tuple::make_tuple(env, &[error, msg])
+            }
+        },
+        Err(e) => {
+            let error = rustler::types::atom::error().encode(env);
+            let msg = e.to_string().encode(env);
+            rustler::types::tuple::make_tuple(env, &[error, msg])
+        }
+    }
+}
+
+/// Restore previously captured state into this session, returning `:ok` or
+/// `{:error, message}`. The session's configured capabilities (builtins,
+/// virtual_fs, mounts, limits) are preserved — only shell state and in-memory
+/// VFS contents are overwritten. bashkit validates the whole snapshot before
+/// mutating, so a bad/tampered/wrong-key snapshot leaves the session untouched
+/// and usable. `key` must match how the snapshot was taken (keyed vs plain).
+#[rustler::nif(schedule = "DirtyCpu")]
+fn session_restore<'a>(
+    env: Env<'a>,
+    session: ResourceArc<SessionResource>,
+    data: Binary<'a>,
+    key: Option<Binary<'a>>,
+) -> Term<'a> {
+    let mut bash = session
+        .bash
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let result = match key {
+        Some(key) => bash.restore_snapshot_keyed(data.as_slice(), key.as_slice()),
+        None => bash.restore_snapshot(data.as_slice()),
+    };
 
     match result {
         Ok(()) => rustler::types::atom::ok().encode(env),

@@ -232,6 +232,41 @@ Reads and writes are both supported (`read`/`write`/`append`/`mkdir`/`remove`/
 FS, `:files`, and host `:mounts`, and reuses the same back-call machinery (and
 failure isolation) as custom builtins.
 
+## Snapshot & resume
+
+Capture a session's state to a binary and reload it later — after a restart, or
+on another node. `snapshot/2` serializes the **shell state** (variables, env,
+cwd, aliases, functions) **and in-memory filesystem contents**; `restore/3` loads
+it back.
+
+```elixir
+session = ExBashkit.Session.new()
+{:ok, _} = ExBashkit.Session.exec(session, "x=42; echo data > /work.txt")
+
+{:ok, bytes} = ExBashkit.Session.snapshot(session)
+# ...persist `bytes`, restart, come back later...
+
+resumed = ExBashkit.Session.new()
+{:ok, resumed} = ExBashkit.Session.restore(resumed, bytes)
+ExBashkit.Session.exec(resumed, "echo $x; cat /work.txt")
+# => {:ok, %ExBashkit.Result{stdout: "42\ndata\n", exit_code: 0}}
+```
+
+A snapshot carries interpreter state, **not** session *configuration*: custom
+`:builtins`, `:virtual_fs` backends, host `:mounts`, and `:limits` are live
+Elixir processes / builder config, not bytes. To resume a session that used
+them, rebuild it with the **same capabilities**, then restore — the backends
+re-attach live and only the shell + in-memory FS travel in the snapshot.
+`restore/3` preserves the target session's capabilities and validates the whole
+snapshot before mutating, so a bad snapshot returns `{:error, _}` and leaves the
+session usable.
+
+For snapshots that cross a **trust boundary** (network, shared storage, untrusted
+input), pass `key:` — an HMAC secret that must match on restore; a wrong key or
+tampered bytes are rejected. Without a key, the embedded digest detects accidental
+corruption only (it is public, not a forgery defense). `:exclude_filesystem` and
+`:exclude_functions` trim what is captured.
+
 ## Why a virtual bash?
 
 | | Real `System.cmd/3` | ExBashkit |
@@ -289,7 +324,8 @@ See [`PORTING.md`](PORTING.md) for the staged plan. In brief:
 6. ✅ Elixir-defined custom builtins (`:builtins` — call back into your app)
 7. ✅ Dynamic Elixir-backed filesystem (`:virtual_fs` — same back-call bridge)
 8. ◻ Optional builtins: `sqlite` (Turso), `typescript` (ZapCode), `python` (monty)
-9. ◻ Snapshot / resume
+   — deferred pending a per-interpreter build-cost decision
+9. ✅ Snapshot / resume (`snapshot/2` + `restore/3`, keyed or plain)
 10. ◻ LLM tool contract helpers
 
 ## Relationship to bashkit
