@@ -10,9 +10,9 @@ uncommitted scratch — keep it refreshed as you go.
 
 ## TL;DR — where things stand
 
-**Phases 1–8 are shipped to `master`, CI green, 173 tests.** The library wraps
-bashkit faithfully (we vendor no execution logic — every semantic comes from
-bashkit; we only marshal data). Public surface:
+**Phases 1–9 are shipped to `master`, CI green, 173 tests — the staged port is
+complete.** The library wraps bashkit faithfully (we vendor no execution logic —
+every semantic comes from bashkit; we only marshal data). Public surface:
 
 - `ExBashkit.exec/1` — stateless, fresh sandbox per call.
 - `ExBashkit.Session` — persistent, stateful sandbox:
@@ -37,11 +37,14 @@ bashkit; we only marshal data). Public surface:
   in its moduledoc).
 - `ExBashkit.Python` — the `python` builtin (optional, `ex_monty`-backed).
 
-**Next: Phase 9 — LLM tool contract helpers** (`ExBashkit.Tool`: emit a JSON
-schema + system-prompt text, parse tool calls — the Elixir analogue of bashkit's
-`BashTool`; pure Elixir, no Rust feature cost). Phases 7 (python) and 8
-(snapshot/resume) are **done**. (P6c later: proxy `mv`/`cp` across virtual mounts;
-streaming. Possible future: a monty fork for `sys.argv`; output-byte limits.)
+**The staged port (Phases 1–9) is complete.** Phase 9 (LLM tool contract) shipped
+as a recipe, not a module (README + `examples/llm_tool.exs`) — the user's call:
+the glue is ~10 lines of plain data, so a module would just couple us to one LLM
+lib. Remaining ideas are optional follow-ups, none blocking: P6c (proxy `mv`/`cp`
+across virtual mounts; streaming output), a monty fork for `sys.argv`, output-byte
+limits + `%Result{}` truncation flags. **Hex publish is still deferred to the
+user** (see UPDATE_PROCEDURE; and the ex_monty checksum-at-tag lesson applies to
+our own release — regenerate + commit the checksum file before tagging).
 
 ---
 

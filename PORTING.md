@@ -168,7 +168,7 @@ Pause/resume *is* possible (phase 8), and serialization patterns from ExMonty's
 Each phase: implement the NIF(s), add the Elixir API + struct, write tests
 (`EXBASHKIT_BUILD=1 mix test`), update README + CHANGELOG, keep CI green.
 
-> **Status (Phases 1–6b + 7 + 8 shipped to `master`, CI green; 173 tests).** Everything
+> **Status (Phases 1–9 shipped to `master`, CI green; 173 tests). Port complete.** Everything
 > below the line is built. The per-phase loop that's working: TDD (write the
 > failing test first) → implement → full gate (`mix test` + `mix format` +
 > `cargo fmt` + `cargo clippy -D warnings`) → dispatch the `superpowers:code-reviewer`
@@ -332,10 +332,17 @@ Hard-won specifics (don't re-derive):
   captured (correct). Design: `docs/plans/2026-06-20-snapshot-resume-design.md`.
   (Snapshots are command-boundary, NOT a pause-mid-effect primitive.)
 
-### Phase 9 — LLM tool contract helpers
-- An `ExBashkit.Tool` module that emits a JSON schema + system-prompt text and
-  parses tool calls — the Elixir analogue of bashkit's `BashTool`. This is what
-  makes it drop-in for agent frameworks.
+### Phase 9 — LLM tool contract ✅ (shipped as a recipe, not a module)
+- Decision (user, 2026-06-20): **no `ExBashkit.Tool` module.** bashkit's own
+  `BashTool` is framework-agnostic (plain JSON request schema
+  `{commands: string, timeout_ms?}` + `system_prompt()` string), and the glue to
+  turn a session into an agent tool is ~10 lines of plain data (schema +
+  system prompt + an `args -> result string` function). Wrapping it would either
+  couple us to one LLM lib (ReqLLM/LangChain/…) or duplicate what they already do.
+- Shipped as a documented recipe: README "Using a session as an LLM tool" +
+  runnable `examples/llm_tool.exs` (simulated agent turn showing persistent
+  state across calls + a ReqLLM `Tool.new/1` wiring snippet). Framework-agnostic;
+  `args -> result` plugs into anything.
 
 ---
 

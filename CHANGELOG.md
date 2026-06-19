@@ -4,6 +4,12 @@
 
 ### Added
 
+- LLM tool recipe. A session can be used as an agent "bash" tool with a small
+  amount of plain data (a JSON schema, a system prompt, and a function that runs
+  a tool call and formats the result) — documented in the README and a runnable
+  `examples/llm_tool.exs` (with a ReqLLM wiring snippet). Deliberately *not* a
+  module: the glue is framework-specific and tiny, so ExBashkit stays agnostic.
+
 - Sandboxed `python` builtin. `ExBashkit.Session.new(python: true)` registers
   `python`/`python3` virtual executables that run sandboxed Python (via the
   optional `:ex_monty` dependency) **sharing the session's virtual filesystem** —

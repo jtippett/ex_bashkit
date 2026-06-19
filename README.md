@@ -304,6 +304,52 @@ tampered bytes are rejected. Without a key, the embedded digest detects accident
 corruption only (it is public, not a forgery defense). `:exclude_filesystem` and
 `:exclude_functions` trim what is captured.
 
+## Using a session as an LLM tool
+
+ExBashkit deliberately ships **no** `Tool` module. Wiring a sandbox to an LLM is a
+handful of plain data — a JSON schema, a system prompt, and a function that runs a
+tool call and formats the result — and every agent framework wants that data in
+its own shape. So it's a short recipe rather than a dependency:
+
+```elixir
+session = ExBashkit.Session.new(python: true)
+
+# 1. The tool's input schema (mirrors bashkit's BashTool contract):
+schema = %{
+  "type" => "object",
+  "required" => ["commands"],
+  "properties" => %{"commands" => %{"type" => "string"}}
+}
+
+# 2. Run one tool call -> the string the model sees:
+run = fn %{"commands" => commands} ->
+  case ExBashkit.Session.exec(session, commands) do
+    {:ok, %ExBashkit.Result{stdout: out, stderr: err, exit_code: code}} ->
+      out <> (if err == "", do: "", else: "\n[stderr]\n" <> err) <>
+              (if code == 0, do: "", else: "\n[exit #{code}]")
+    {:error, message} -> "tool error: #{message}"
+  end
+end
+```
+
+Because a **session** persists state across calls, the model can build up a
+workspace over a multi-step turn (write a file, process it, run `python3` on it) —
+exactly what you want from an agentic shell. Plug `run` into any framework, e.g.
+[ReqLLM](https://hex.pm/packages/req_llm):
+
+```elixir
+{:ok, tool} =
+  ReqLLM.Tool.new(
+    name: "bash",
+    description: "Run bash in a sandboxed virtual shell.",
+    parameter_schema: [commands: [type: :string, required: true]],
+    callback: fn args -> {:ok, run.(args)} end
+  )
+```
+
+A complete, runnable version (with a system prompt and a simulated agent turn) is
+in [`examples/llm_tool.exs`](examples/llm_tool.exs).
+
 ## Why a virtual bash?
 
 | | Real `System.cmd/3` | ExBashkit |
@@ -364,7 +410,8 @@ See [`PORTING.md`](PORTING.md) for the staged plan. In brief:
    `sqlite`/`typescript` dropped (use a back-call); native bashkit interpreters
    not pursued (not on crates.io, would break the pin)
 9. ✅ Snapshot / resume (`snapshot/2` + `restore/3`, keyed or plain)
-10. ◻ LLM tool contract helpers
+10. ✅ LLM tool contract — a documented recipe (`examples/llm_tool.exs`), not a
+    module: a session is a tool in ~10 lines, framework-agnostic
 
 ## Relationship to bashkit
 
