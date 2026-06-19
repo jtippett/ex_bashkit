@@ -10,10 +10,11 @@ escape hatch. Nothing touches the host OS unless you explicitly grant it. That
 makes it safe to run *untrusted* scripts — for example, bash written by an LLM
 agent.
 
-> ⚠️ **Early scaffold.** Only stateless `ExBashkit.exec/1` is wired up today.
-> The full surface (sessions, virtual-filesystem mounts, resource limits, a
-> network allowlist, Elixir-defined custom builtins, snapshot/resume) is in
-> progress — see [`PORTING.md`](PORTING.md) for the plan and current status.
+> ⚠️ **Early days.** Stateless `ExBashkit.exec/1` and persistent
+> `ExBashkit.Session`s are wired up today. The rest of the surface
+> (virtual-filesystem mounts, resource limits, a network allowlist,
+> Elixir-defined custom builtins, snapshot/resume) is in progress — see
+> [`PORTING.md`](PORTING.md) for the plan and current status.
 
 ## Installation
 
@@ -44,6 +45,42 @@ iex> ExBashkit.exec("test -f /etc/passwd")
 {:ok, %ExBashkit.Result{exit_code: 1}}
 ```
 
+## Persistent sessions
+
+`ExBashkit.exec/1` is stateless — each call is a fresh sandbox. When you want
+state to carry across calls (like an interactive shell), use a
+`ExBashkit.Session`: environment variables, the working directory, the in-memory
+filesystem, shell functions and aliases all persist.
+
+```elixir
+session = ExBashkit.Session.new()
+
+ExBashkit.Session.exec(session, "export GREETING=hello")
+ExBashkit.Session.exec(session, "cd /tmp && echo world > note.txt")
+
+{:ok, result} = ExBashkit.Session.exec(session, "echo $GREETING $(cat /tmp/note.txt)")
+result.stdout
+# => "hello world\n"
+```
+
+Seed the initial state with options:
+
+```elixir
+session =
+  ExBashkit.Session.new(
+    env: %{"LANG" => "C"},
+    cwd: "/tmp",
+    username: "alice",
+    hostname: "my-server"
+  )
+
+ExBashkit.Session.exec(session, "whoami")   # => "alice\n"
+ExBashkit.Session.exec(session, "pwd")      # => "/tmp\n"
+```
+
+A session serializes its own calls — concurrent `exec/2` on the *same* session
+run one at a time. Separate sessions are fully independent.
+
 ## Why a virtual bash?
 
 | | Real `System.cmd/3` | ExBashkit |
@@ -67,7 +104,8 @@ for its optional `python` builtin.
 - **Network:** off by default; opt-in per-domain allowlist (planned).
 - **Resource limits:** command count, loop iterations, output size, recursion
   depth (planned to be exposed; enforced in bashkit today).
-- **Isolation:** each `exec/1` runs in an independent sandbox.
+- **Isolation:** each `exec/1` runs in an independent sandbox; a
+  `Session` is an independent sandbox that persists across its own calls.
 
 ## Development
 
@@ -90,7 +128,7 @@ CI runs `mix format --check-formatted`, `cargo fmt --check`,
 See [`PORTING.md`](PORTING.md) for the staged plan. In brief:
 
 1. ✅ Stateless `exec/1` (skeleton, proves the toolchain)
-2. ◻ Persistent sessions (state across calls)
+2. ✅ Persistent sessions (state across calls)
 3. ◻ Virtual-filesystem mounts (host dirs, `:read_only` / `:read_write` / `:overlay`)
 4. ◻ Resource limits
 5. ◻ Network allowlist
