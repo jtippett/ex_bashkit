@@ -1,0 +1,110 @@
+# ExBashkit
+
+Elixir NIF wrapper for [**bashkit**](https://github.com/everruns/bashkit) — a
+sandboxed, virtual bash interpreter written in Rust.
+
+Run bash scripts safely from Elixir: ~150 builtins (`echo`, `grep`, `sed`,
+`awk`, `jq`, `cat`, `find`, `sort`, …) are **reimplemented in Rust**, file I/O
+hits an **in-memory virtual filesystem**, and there is **no `fork`/`exec`**
+escape hatch. Nothing touches the host OS unless you explicitly grant it. That
+makes it safe to run *untrusted* scripts — for example, bash written by an LLM
+agent.
+
+> ⚠️ **Early scaffold.** Only stateless `ExBashkit.exec/1` is wired up today.
+> The full surface (sessions, virtual-filesystem mounts, resource limits, a
+> network allowlist, Elixir-defined custom builtins, snapshot/resume) is in
+> progress — see [`PORTING.md`](PORTING.md) for the plan and current status.
+
+## Installation
+
+```elixir
+def deps do
+  [
+    {:ex_bashkit, "~> 0.1"}
+  ]
+end
+```
+
+A precompiled NIF is downloaded for your platform — no Rust toolchain required
+to *use* the library. Supported targets: `{x86_64,aarch64}-apple-darwin` and
+`{x86_64,aarch64}-unknown-linux-gnu`.
+
+## Quick start
+
+```elixir
+iex> ExBashkit.exec("echo hello | tr a-z A-Z")
+{:ok, %ExBashkit.Result{stdout: "HELLO\n", stderr: "", exit_code: 0}}
+
+iex> ExBashkit.exec("for i in 1 2 3; do echo $((i * i)); done")
+{:ok, %ExBashkit.Result{stdout: "1\n4\n9\n", exit_code: 0}}
+
+# A non-zero exit is still {:ok, ...} — the script ran and chose to fail,
+# exactly like a real shell.
+iex> ExBashkit.exec("test -f /etc/passwd")
+{:ok, %ExBashkit.Result{exit_code: 1}}
+```
+
+## Why a virtual bash?
+
+| | Real `System.cmd/3` | ExBashkit |
+|---|---|---|
+| Spawns OS processes | yes (`fork`/`exec`) | **no** — pure in-process |
+| Host filesystem | full access | **virtual**, empty by default |
+| Network | unrestricted | **denied** by default (allowlist planned) |
+| Safe for untrusted input | no | **yes** |
+| Determinism / reproducibility | depends on host | high |
+
+It's the same design philosophy as its sibling
+[ExMonty](https://github.com/jtippett/ex_monty) (sandboxed *Python*): the guest
+language runs inert, and the host grants capabilities. bashkit even embeds monty
+for its optional `python` builtin.
+
+## Security model
+
+- **Filesystem:** in-memory virtual FS; no host paths are reachable. (Mounting
+  host directories with explicit modes is planned — see the roadmap.)
+- **Processes:** none. All commands are reimplemented Rust builtins.
+- **Network:** off by default; opt-in per-domain allowlist (planned).
+- **Resource limits:** command count, loop iterations, output size, recursion
+  depth (planned to be exposed; enforced in bashkit today).
+- **Isolation:** each `exec/1` runs in an independent sandbox.
+
+## Development
+
+To build the NIF from source (instead of downloading a precompiled one):
+
+```bash
+export EXBASHKIT_BUILD=1
+mix deps.get
+mix test
+```
+
+This requires a Rust toolchain. The first build is slow — bashkit and its
+dependencies are large.
+
+CI runs `mix format --check-formatted`, `cargo fmt --check`,
+`cargo clippy -- -D warnings`, and `mix test` on every push/PR.
+
+## Roadmap
+
+See [`PORTING.md`](PORTING.md) for the staged plan. In brief:
+
+1. ✅ Stateless `exec/1` (skeleton, proves the toolchain)
+2. ◻ Persistent sessions (state across calls)
+3. ◻ Virtual-filesystem mounts (host dirs, `:read_only` / `:read_write` / `:overlay`)
+4. ◻ Resource limits
+5. ◻ Network allowlist
+6. ◻ Elixir-defined custom builtins (call back into your app)
+7. ◻ Optional builtins: `sqlite` (Turso), `typescript` (ZapCode), `python` (monty)
+8. ◻ Snapshot / resume
+9. ◻ LLM tool contract helpers
+
+## Relationship to bashkit
+
+ExBashkit pins an exact bashkit version and vendors no logic — all execution
+semantics come from upstream. Version bumps follow
+[`UPDATE_PROCEDURE.md`](UPDATE_PROCEDURE.md).
+
+## License
+
+MIT © James Tippett. bashkit is MIT-licensed by its authors.

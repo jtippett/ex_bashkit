@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Test & lint (Elixir ${{ matrix.elixir }} / OTP ${{ matrix.otp }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - otp: "27.2"
+            elixir: "1.18.0"
+    env:
+      MIX_ENV: test
+      EXBASHKIT_BUILD: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ matrix.otp }}
+          elixir-version: ${{ matrix.elixir }}
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache mix deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: mix-${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            mix-${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            native/ex_bashkit/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('native/ex_bashkit/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: Fetch dependencies
+        run: mix deps.get
+
+      - name: Check Elixir formatting
+        run: mix format --check-formatted
+
+      - name: Check Rust formatting
+        working-directory: native/ex_bashkit
+        run: cargo fmt --check
+
+      - name: Compile (warnings as errors)
+        run: mix compile --warnings-as-errors
+
+      - name: Clippy
+        working-directory: native/ex_bashkit
+        run: cargo clippy -- -D warnings
+
+      - name: Run tests
+        run: mix test

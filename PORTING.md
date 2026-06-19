@@ -1,0 +1,234 @@
+# ExBashkit Porting Playbook
+
+How to grow this scaffold into a complete, community-grade Elixir wrapper around
+bashkit. It distills the lessons from the sibling project **ExMonty** (which
+wraps the `monty` Python interpreter the same way) and lays out a staged plan
+for the parts that are genuinely different here — chiefly bashkit's `async` API
+and its "configure-then-run" effect model.
+
+Read this top-to-bottom once, then work the phases in order. Each phase is
+shippable on its own.
+
+---
+
+## 0. The shape of the thing
+
+ExBashkit is a thin **Rustler NIF** over the `bashkit` crate, distributed as a
+**precompiled binary** via `rustler_precompiled` so end users need no Rust
+toolchain. The Elixir side owns the ergonomics (structs, the public API, the
+eventual LLM-tool helpers); the Rust side is a faithful, minimal bridge.
+
+```
+lib/ex_bashkit.ex            # public API
+lib/ex_bashkit/native.ex     # RustlerPrecompiled config + NIF stubs
+lib/ex_bashkit/result.ex     # %ExBashkit.Result{}
+native/ex_bashkit/src/lib.rs # #[rustler::nif] fns + shared tokio runtime
+```
+
+**Golden rule (carried from ExMonty):** vendor *no* execution logic on the
+Elixir side. Every semantic — what a builtin does, how the VFS behaves, what a
+limit means — comes from bashkit. We only marshal data across the boundary. When
+bashkit changes, we should mostly be updating encodings, not behavior.
+
+---
+
+## 1. Lessons inherited from ExMonty
+
+These cost real time on ExMonty. Honor them here.
+
+### Rustler 0.37 specifics
+- NIFs are auto-discovered from `#[rustler::nif]`; `rustler::init!("Elixir.ExBashkit.Native")` takes only the module name (no fn list).
+- Resources: `#[rustler::resource_impl] impl Resource for T {}`. Wrap them in `ResourceArc<T>`.
+- For any bashkit API that **consumes `self`** (e.g. a snapshot's `resume`),
+  store it as `Mutex<Option<T>>` inside the resource and `.take()` on use. Once
+  taken, return a clean "already consumed" error. (ExMonty does exactly this for
+  `Snapshot`/`FutureSnapshot`.)
+- You cannot call Erlang functions from inside a NIF in 0.37. Anything that
+  needs Elixir's help must be modeled as *data returned to Elixir*, which Elixir
+  acts on and passes back — see the custom-builtins phase.
+
+### The precompiled-NIF release dance (the part everyone gets wrong)
+- `lib/ex_bashkit/native.ex` downloads a prebuilt NIF whose checksum must be in
+  `checksum-Elixir.ExBashkit.Native.exs`. **That file starts empty and is
+  regenerated *after* a release exists.** The full ordering lives in
+  [`UPDATE_PROCEDURE.md`](UPDATE_PROCEDURE.md), but the trap is:
+  1. tag `vX.Y.Z` → `release.yml` builds the 4 NIFs and creates the GitHub release,
+  2. **then** `mix rustler_precompiled.download ExBashkit.Native --all --print`
+     downloads them and writes the checksum file,
+  3. commit the checksum file, **then** `mix hex.publish`.
+- The download task has a **chicken-and-egg**: it must *compile* `native.ex`
+  first, which tries to fetch a NIF that isn't published yet. Run it with
+  `EXBASHKIT_BUILD=1` so the local build satisfies compilation, e.g.
+  `EXBASHKIT_BUILD=1 mix rustler_precompiled.download ExBashkit.Native --all --print`.
+- Keep the NIF ABI version (`nif-2.15`) in `release.yml` in sync with rustler.
+
+### Pin exact versions, never a moving ref
+- bashkit is on crates.io, so pin `bashkit = "=0.11.0"` (exact). Bump
+  deliberately via the update procedure. (ExMonty had to pin a 40-char git hash
+  because monty isn't published; we have it easier.)
+
+### CI gates that catch the common breakage
+- `mix format --check-formatted`, `cargo fmt --check`,
+  `cargo clippy -- -D warnings`, `mix compile --warnings-as-errors`, `mix test`.
+- CI builds the NIF from source (`EXBASHKIT_BUILD=1`) rather than downloading.
+
+### Docs are part of "done"
+- Every new public function/field gets a moduledoc + `@spec` + a doctest or
+  test. Every new capability gets a README section and a CHANGELOG entry. On
+  ExMonty, doc drift was the easiest thing to forget.
+
+---
+
+## 2. What's genuinely different about bashkit
+
+### a) `bashkit::Bash::exec` is `async` (tokio)
+monty was synchronous; bashkit is not. The bridge (already in the skeleton):
+
+- Host **one** process-wide `tokio` runtime via `OnceLock` and `block_on` it
+  from inside a **dirty** NIF (`schedule = "DirtyCpu"`, or `DirtyIo` once the
+  network feature can actually block on sockets). Do **not** build a runtime per
+  call.
+- Multi-thread + `enable_all` is the safe default and is *required* by the
+  `sqlite` feature.
+- Never `block_on` from a regular (non-dirty) NIF — you'll stall a scheduler.
+
+### b) bashkit's effect model is "configure-then-run", not "yield-per-effect"
+This is the deepest conceptual difference and it changes how host mediation
+works:
+
+- **ExMonty/monty** is *pull-based*: the run loop yields each OS call back to
+  Elixir, which adjudicates it and resumes. The host sees every effect.
+- **bashkit** is *push-based*: you configure capabilities up front on the
+  `Bash::builder()` — which virtual filesystem, which network allowlist, which
+  custom builtins — then let the whole script run. The host grants, then steps
+  back.
+
+Practical consequence: most "host control" is expressed as **builder
+configuration** (phases 3–5) plus **custom builtins** (phase 6), not as a
+per-effect run loop. If you want monty-style per-effect mediation, that lives
+inside a *custom builtin* that calls back into Elixir.
+
+> ⚠️ **This is the central architectural risk of the port — do not gloss it.**
+> ExMonty's serialization and resource patterns transfer directly. Its
+> *effect-mediation* pattern does **not**, because of async + push execution:
+>
+> - monty turns each effect into a **return value** (`{:os_call, ...}`) and
+>   resumes via a fresh NIF call. Nobody holds a scheduler while the host
+>   thinks; it's trivially snapshot/resume-across-nodes.
+> - bashkit services effects **inside** the `async` run. A host callback means an
+>   `async` builtin must `send` to an Elixir pid and **block awaiting a reply on
+>   a channel — mid-`block_on`, on the dirty scheduler stack.** Rust → Elixir →
+>   Rust round-trip in the middle of execution.
+>
+> Three consequences to design around:
+> 1. **Inversion of control** at the callback boundary (deadlock/lifetime
+>    hazards; far hairier than `resume/2`).
+> 2. **A scheduler is pinned for the whole script**, including time spent waiting
+>    on Elixir — the finite dirty pool can starve under concurrent sandboxes that
+>    call back. Bound concurrency / pool the sessions.
+> 3. **Cancellation is hard**: a running dirty NIF can't be cleanly killed. Rely
+>    on bashkit's internal limits + a tokio timeout, not BEAM `Task.shutdown`.
+>
+> `Snapshot` does **not** rescue this — it saves whole sessions at command
+> boundaries, it is not a pause-mid-effect primitive.
+>
+> **Design stance:** don't fight bashkit into monty's shape. Pre-grant
+> capabilities up front (VFS contents, allowlist, env) to cover the 80% case with
+> zero callbacks. Quarantine the channel-bridge to phase 6, and build/prove that
+> machinery first via **streaming output** (phase 9's simpler cousin) before
+> interactive builtins. For the simple `exec` path, async stays invisible.
+
+### c) Feature flags gate large optional subsystems
+From bashkit's `Cargo.toml`:
+- `default = ["bash_tool"]` — the Rust LLM-tool wrapper. We build our tool
+  contract on the Elixir side, so we start `default-features = false`.
+- `python = ["dep:monty"]` — **monty is a git dep upstream, unavailable from the
+  crates.io build.** Enabling `python` from the registry won't work; it needs a
+  git source for bashkit (or wait for monty on crates.io). Document loudly.
+- `sqlite` — pulls Turso (multi-MB) and needs `tokio/rt-multi-thread`; also
+  double-gated at runtime by `BASHKIT_ALLOW_INPROCESS_SQLITE=1`.
+- `typescript`, `git`, `ssh`, `http_client`, `jq` — each opt-in.
+- Adding a feature roughly multiplies build time. Add them per-phase, behind
+  documented mix/env switches, not all at once.
+
+### d) Build size & time
+bashkit is ~150k LOC plus heavy deps. Expect slow first builds. Lean on
+`Swatinem/rust-cache` (release) and the cargo cache (CI). Keep the default
+feature set minimal so most users get fast precompiled downloads anyway.
+
+### e) bashkit has `Snapshot` / `SnapshotOptions`
+Pause/resume *is* possible (phase 8), and serialization patterns from ExMonty's
+`serialization.rs` (postcard dump/load behind a resource) transfer directly.
+
+---
+
+## 3. Staged plan
+
+Each phase: implement the NIF(s), add the Elixir API + struct, write tests
+(`EXBASHKIT_BUILD=1 mix test`), update README + CHANGELOG, keep CI green.
+
+### Phase 1 — Stateless `exec/1` ✅ (skeleton)
+Done. Proves rustler + tokio bridge + bashkit link + the precompiled pipeline.
+**First kickoff task: confirm it actually compiles and the smoke tests pass**
+(`EXBASHKIT_BUILD=1 mix test`), then cut `v0.1.0` to validate the release flow
+before building further.
+
+### Phase 2 — Persistent sessions & state
+- Wrap `Bash` in `ResourceArc<Mutex<Bash>>` → `ExBashkit.Session`.
+- `new/1`, `exec/2` threading state (env, cwd, VFS) across calls.
+- `Bash::builder()` options: `username`, `hostname`, `env`, `cwd`.
+- Decode an options keyword list/map on the Elixir side into builder calls.
+
+### Phase 3 — Virtual filesystem
+- Expose `InMemoryFs` (default), seedable with files from Elixir.
+- Host mounts via `RealFs`/`MountableFs` with explicit modes — mirror ExMonty's
+  `ExBashkit.Mount` design (`:read_only` / `:read_write` / `:overlay`, path
+  canonicalization, escape checks). bashkit provides `OverlayFs`/`MountableFs`.
+
+### Phase 4 — Resource limits
+- Map `ExecutionLimits` (`max_commands`, `max_loop_iterations`,
+  `max_function_depth`, `max_output_bytes`) to an Elixir keyword list, decoded
+  into the builder. (Same shape as ExMonty's `decode_resource_limits`.)
+
+### Phase 5 — Network allowlist
+- `NetworkAllowlist` behind the `http_client` feature. Default deny. Switch the
+  relevant NIF to `DirtyIo` since real sockets can block.
+
+### Phase 6 — Elixir-defined custom builtins (the high-value, hard part)
+- bashkit lets you register an `async` `Builtin`. To call back into Elixir from
+  inside a dirty NIF, use the Rustler 0.37-friendly pattern: the builtin sends a
+  message to a registered Elixir process (or uses an `OwnedEnv` + `send`) and
+  blocks on a reply channel; Elixir runs the handler and sends the result back.
+  This is how you recover monty-style per-effect mediation (e.g. an `http`
+  builtin that asks your app to approve each request).
+- Design the handler contract to mirror `ExBashkit.Sandbox`-style dispatch.
+
+### Phase 7 — Optional embedded interpreters
+- `sqlite` (Turso), `typescript` (ZapCode), `python` (monty — **git-dep
+  caveat**, see §2c). Each behind a mix config flag + cargo feature. Document the
+  build-cost and the runtime gates (`BASHKIT_ALLOW_INPROCESS_SQLITE`).
+- Note: enabling `python` makes ExBashkit a *superset* of ExMonty's Python
+  surface (but without monty's fine-grained per-effect mediation).
+
+### Phase 8 — Snapshot / resume
+- `Snapshot`/`SnapshotOptions` → postcard dump/load behind a resource. Reuse
+  ExMonty `serialization.rs` patterns. Enables pausing a long script and
+  resuming later / on another node.
+
+### Phase 9 — LLM tool contract helpers
+- An `ExBashkit.Tool` module that emits a JSON schema + system-prompt text and
+  parses tool calls — the Elixir analogue of bashkit's `BashTool`. This is what
+  makes it drop-in for agent frameworks.
+
+---
+
+## 4. Definition of done (per phase and overall)
+
+- [ ] NIF stubs in `native.ex` match the `#[rustler::nif]` fns exactly.
+- [ ] Public functions have moduledocs, `@spec`s, and doctests/tests.
+- [ ] `EXBASHKIT_BUILD=1 mix test` green; `cargo fmt`/`clippy` clean.
+- [ ] README capability section + CHANGELOG `[Unreleased]` entry.
+- [ ] An `examples/` script demonstrating the new capability end-to-end.
+- [ ] No vendored execution logic — semantics come from bashkit.
+
+When in doubt, open the ExMonty repo next door and copy the proven shape.

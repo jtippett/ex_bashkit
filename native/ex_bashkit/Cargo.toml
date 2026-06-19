@@ -1,0 +1,33 @@
+[package]
+name = "ex_bashkit"
+version = "0.1.0"
+edition = "2021"
+# bashkit tracks a recent toolchain; bump this if cargo complains about the
+# minimum supported Rust version of bashkit or its transitive deps.
+rust-version = "1.82"
+
+[lib]
+name = "ex_bashkit"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+rustler = "0.37"
+
+# bashkit IS published to crates.io (unlike monty, which is git-only), so we pin
+# an exact semver. Bump deliberately via UPDATE_PROCEDURE.md.
+#
+# Feature notes (see PORTING.md "Feature flags"):
+#   - default = ["bash_tool"] — the Rust-side LLM tool wrapper. We build our own
+#     tool contract on the Elixir side, so we start with default-features = false.
+#   - "python" needs monty, which is a GIT dep upstream — NOT available from the
+#     crates.io build of bashkit. Enabling it requires a git source. Left off for now.
+#   - "sqlite" pulls turso (multi-MB) and needs tokio/rt-multi-thread.
+#   - "http_client", "typescript", "git", "ssh", "jq" are each opt-in.
+bashkit = { version = "=0.11.0", default-features = false }
+# For local iteration against a checkout, comment the line above and use:
+# bashkit = { path = "../../../bashkit/crates/bashkit", default-features = false }
+
+# bashkit's `exec` is async (tokio). We host a single shared runtime and
+# block_on it from inside dirty NIFs. See src/lib.rs.
+tokio = { version = "1", features = ["rt-multi-thread"] }

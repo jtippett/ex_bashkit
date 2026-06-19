@@ -1,0 +1,91 @@
+name: Build precompiled NIFs
+
+# Push a tag (v0.1.0, v0.2.0, ...) to build NIFs for every target and attach
+# them to a GitHub release. AFTER this finishes, regenerate the checksum file
+# locally and `mix hex.publish` — see UPDATE_PROCEDURE.md.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: NIF ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          # Native arm64 runner avoids cross-compilation pain for the Rust deps.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native/ex_bashkit
+
+      - name: Build NIF
+        working-directory: native/ex_bashkit
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package NIF
+        id: package
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          TARGET="${{ matrix.target }}"
+          # NIF ABI version 2.15 — keep in sync with the rustler version used.
+          NIF_NAME="libex_bashkit-v${VERSION}-nif-2.15-${TARGET}.so"
+
+          if [[ "$TARGET" == *"apple"* ]]; then
+            SRC="native/ex_bashkit/target/${TARGET}/release/libex_bashkit.dylib"
+          else
+            SRC="native/ex_bashkit/target/${TARGET}/release/libex_bashkit.so"
+          fi
+
+          cp "$SRC" "${NIF_NAME}"
+          tar -czf "${NIF_NAME}.tar.gz" "${NIF_NAME}"
+          echo "archive=${NIF_NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload NIF artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nif-${{ matrix.target }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: nif-*
+          merge-multiple: true
+          path: artifacts
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.tar.gz
