@@ -29,4 +29,8 @@ defmodule ExBashkit.Native do
   # Core — keep these stubs in sync with the #[rustler::nif] fns in
   # native/ex_bashkit/src/lib.rs. Each raises until the NIF library loads.
   def exec(_script), do: :erlang.nif_error(:nif_not_loaded)
+
+  # Sessions (persistent, stateful interpreters held as a resource).
+  def session_new(_env, _cwd, _username, _hostname), do: :erlang.nif_error(:nif_not_loaded)
+  def session_exec(_session, _script), do: :erlang.nif_error(:nif_not_loaded)
 end

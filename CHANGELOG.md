@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- `ExBashkit.Session` — persistent, stateful sandboxes. Unlike `exec/1`, a
+  session's environment variables, working directory, in-memory filesystem,
+  shell functions and aliases persist across `ExBashkit.Session.exec/2` calls.
+  `ExBashkit.Session.new/1` seeds initial state via `:env`, `:cwd`, `:username`,
+  and `:hostname` options. Each session is an independent sandbox and serializes
+  its own calls.
+
 ## 0.1.0
 
 ### Added
