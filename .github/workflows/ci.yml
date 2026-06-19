@@ -27,7 +27,7 @@ jobs:
       MIX_ENV: test
       EXBASHKIT_BUILD: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Elixir
         uses: erlef/setup-beam@v1
@@ -41,7 +41,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache mix deps
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             deps
@@ -51,7 +51,7 @@ jobs:
             mix-${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry

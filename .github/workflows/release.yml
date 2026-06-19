@@ -31,7 +31,7 @@ jobs:
             os: ubuntu-24.04-arm
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Extract version
         id: version
@@ -68,7 +68,7 @@ jobs:
           echo "archive=${NIF_NAME}.tar.gz" >> "$GITHUB_OUTPUT"
 
       - name: Upload NIF artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: nif-${{ matrix.target }}
           path: ${{ steps.package.outputs.archive }}
@@ -79,7 +79,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: nif-*
           merge-multiple: true
