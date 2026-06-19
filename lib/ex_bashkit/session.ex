@@ -31,6 +31,21 @@ defmodule ExBashkit.Session do
       (default `"sandbox"`).
     * `:hostname` - the virtual hostname reported by `hostname`/`uname -n`
       (default `"bashkit-sandbox"`).
+    * `:files` - a map (or keyword list) of `path => content` to seed into the
+      virtual filesystem before the first call, creating parent directories as
+      needed. Content is any `t:iodata/0`. Equivalent to calling `write_file/3`
+      for each entry.
+
+  ## Virtual filesystem
+
+  A session's in-memory filesystem is shared between scripts and the host. Use
+  `write_file/3` to place files (e.g. inputs) and `read_file/2` to pull files
+  back out (e.g. results a script produced) without going through a script:
+
+      iex> session = ExBashkit.Session.new(files: %{"/in.txt" => "data\\n"})
+      iex> {:ok, _} = ExBashkit.Session.exec(session, "wc -l < /in.txt > /out.txt")
+      iex> ExBashkit.Session.read_file(session, "/out.txt")
+      {:ok, "1\\n"}
   """
 
   alias ExBashkit.Result
@@ -45,12 +60,14 @@ defmodule ExBashkit.Session do
           | {:cwd, Path.t()}
           | {:username, String.t()}
           | {:hostname, String.t()}
+          | {:files, %{optional(Path.t()) => iodata()} | [{Path.t(), iodata()}]}
 
   @doc """
   Create a new persistent session, optionally seeding its initial state.
 
   See the module doc for the supported `opts`. Construction is infallible;
-  malformed options raise (they are a programmer error).
+  malformed options raise (they are a programmer error). Raises `ArgumentError`
+  if a `:files` entry cannot be written (e.g. it violates a filesystem limit).
   """
   @spec new([option]) :: t()
   def new(opts \\ []) when is_list(opts) do
@@ -60,7 +77,10 @@ defmodule ExBashkit.Session do
     hostname = opts |> Keyword.get(:hostname) |> normalize_string()
 
     ref = ExBashkit.Native.session_new(env, cwd, username, hostname)
-    %__MODULE__{ref: ref}
+    session = %__MODULE__{ref: ref}
+
+    opts |> Keyword.get(:files, %{}) |> seed_files(session)
+    session
   end
 
   @doc """
@@ -88,6 +108,68 @@ defmodule ExBashkit.Session do
       {:error, message} ->
         {:error, message}
     end
+  end
+
+  @doc """
+  Write `content` (any `t:iodata/0`) to `path` in the session's virtual
+  filesystem, creating parent directories as needed.
+
+  Returns `:ok`, or `{:error, message}` if the write was rejected (e.g. a
+  filesystem limit). The file is immediately visible to subsequent `exec/2`
+  calls and to `read_file/2`.
+
+  `path` is resolved from the filesystem **root**, independent of the session's
+  working directory (the cwd lives in the interpreter, not the filesystem). Pass
+  absolute paths; a relative path like `"out.txt"` is treated as `"/out.txt"`.
+
+  ## Examples
+
+      iex> session = ExBashkit.Session.new()
+      iex> ExBashkit.Session.write_file(session, "/etc/motd", "welcome\\n")
+      :ok
+      iex> {:ok, result} = ExBashkit.Session.exec(session, "cat /etc/motd")
+      iex> result.stdout
+      "welcome\\n"
+  """
+  @spec write_file(t(), Path.t(), iodata()) :: :ok | {:error, String.t()}
+  def write_file(%__MODULE__{ref: ref}, path, content) do
+    ExBashkit.Native.session_write_file(ref, to_string(path), IO.iodata_to_binary(content))
+  end
+
+  @doc """
+  Read the contents of `path` from the session's virtual filesystem.
+
+  Returns `{:ok, binary}` — including for files a script wrote — or
+  `{:error, message}` if the file does not exist or cannot be read. The result
+  is a raw binary, so it round-trips arbitrary (including non-UTF-8) content.
+
+  As with `write_file/3`, `path` is resolved from the filesystem **root**,
+  independent of the session's working directory; pass absolute paths.
+
+  ## Examples
+
+      iex> session = ExBashkit.Session.new()
+      iex> {:ok, _} = ExBashkit.Session.exec(session, "echo result > /out.txt")
+      iex> ExBashkit.Session.read_file(session, "/out.txt")
+      {:ok, "result\\n"}
+  """
+  @spec read_file(t(), Path.t()) :: {:ok, binary()} | {:error, String.t()}
+  def read_file(%__MODULE__{ref: ref}, path) do
+    ExBashkit.Native.session_read_file(ref, to_string(path))
+  end
+
+  # Seed initial files by writing each one; a failed seed is a programmer error.
+  defp seed_files(files, session) when is_map(files) or is_list(files) do
+    Enum.each(files, fn {path, content} ->
+      case write_file(session, path, content) do
+        :ok ->
+          :ok
+
+        {:error, reason} ->
+          raise ArgumentError,
+                "failed to seed file #{inspect(to_string(path))}: #{inspect(reason)}"
+      end
+    end)
   end
 
   # The NIF wants a list of {String, String} pairs; accept a map or keyword list

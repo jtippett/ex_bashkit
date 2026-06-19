@@ -81,6 +81,29 @@ ExBashkit.Session.exec(session, "pwd")      # => "/tmp\n"
 A session serializes its own calls — concurrent `exec/2` on the *same* session
 run one at a time. Separate sessions are fully independent.
 
+## Virtual filesystem
+
+A session's filesystem is in-memory and shared between scripts and the host. You
+can seed inputs, then pull results back out — without going through a script:
+
+```elixir
+session = ExBashkit.Session.new(files: %{"/in/data.csv" => "a,1\nb,2\n"})
+
+{:ok, _} = ExBashkit.Session.exec(session, "cut -d, -f1 /in/data.csv | sort > /out.txt")
+
+ExBashkit.Session.read_file(session, "/out.txt")
+# => {:ok, "a\nb\n"}
+```
+
+- `ExBashkit.Session.new(files: %{path => content})` seeds files up front (content
+  is any iodata; parent dirs are created).
+- `ExBashkit.Session.write_file(session, path, content)` places a file at any time.
+- `ExBashkit.Session.read_file(session, path)` returns `{:ok, binary}` — including
+  files a script wrote — round-tripping arbitrary (even non-UTF-8) bytes.
+
+The filesystem is still fully virtual — no host path is reachable. (Mounting real
+host directories with explicit access modes is the next step; see the roadmap.)
+
 ## Why a virtual bash?
 
 | | Real `System.cmd/3` | ExBashkit |
@@ -129,7 +152,8 @@ See [`PORTING.md`](PORTING.md) for the staged plan. In brief:
 
 1. ✅ Stateless `exec/1` (skeleton, proves the toolchain)
 2. ✅ Persistent sessions (state across calls)
-3. ◻ Virtual-filesystem mounts (host dirs, `:read_only` / `:read_write` / `:overlay`)
+3. ◧ Virtual filesystem — in-memory seed/read/write ✅; host-dir mounts
+   (`:read_only` / `:read_write` / `:overlay`) next
 4. ◻ Resource limits
 5. ◻ Network allowlist
 6. ◻ Elixir-defined custom builtins (call back into your app)

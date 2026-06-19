@@ -4,6 +4,12 @@
 
 ### Added
 
+- Virtual filesystem access from Elixir. `ExBashkit.Session.write_file/3` and
+  `read_file/2` place and retrieve files in a session's in-memory filesystem —
+  shared with scripts, so the host can stage inputs and pull back results
+  (round-tripping arbitrary binary content) without going through a script.
+  `Session.new/1` gains a `:files` option to seed files (creating parent dirs)
+  up front.
 - `ExBashkit.Session` — persistent, stateful sandboxes. Unlike `exec/1`, a
   session's environment variables, working directory, in-memory filesystem,
   shell functions and aliases persist across `ExBashkit.Session.exec/2` calls.

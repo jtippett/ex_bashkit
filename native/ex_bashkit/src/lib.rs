@@ -7,9 +7,12 @@
 //! builtins that call back into Elixir, snapshot/resume) is the porting work —
 //! see PORTING.md for the staged plan and the lessons carried over from ExMonty.
 
-use std::sync::{Mutex, OnceLock};
+use std::panic::AssertUnwindSafe;
+use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock};
 
-use rustler::{Encoder, Env, NifResult, Resource, ResourceArc, Term};
+use bashkit::FileSystem;
+use rustler::{Binary, Encoder, Env, NifResult, OwnedBinary, Resource, ResourceArc, Term};
 use tokio::runtime::Runtime;
 
 /// A single process-wide multi-thread tokio runtime.
@@ -37,8 +40,24 @@ fn runtime() -> &'static Runtime {
 /// session is driven by at most one `exec` at a time (the lock is held for the
 /// duration of the script, on the dirty scheduler thread). The `ResourceArc`
 /// keeps it alive on the Elixir side as an opaque handle.
+///
+/// We also keep a clone of the interpreter's filesystem handle, obtained via
+/// `bash.fs()` *after* `build()`. That is the exact FS the interpreter routes
+/// through — `MountableFs` over the in-memory base, plus whatever overlay /
+/// read-only / real-mount layers the builder applied — so host-side
+/// `read_file`/`write_file` see precisely what scripts see, and vice versa, no
+/// matter how the FS is layered (this matters once mounts/overlays land). The FS
+/// has its own internal synchronization, so those calls don't take the `bash`
+/// lock — the host can read/write files even while a script runs.
+///
+/// The `fs` is wrapped in `AssertUnwindSafe` because rustler runs each NIF
+/// inside `catch_unwind`, which requires every resource argument to be
+/// `RefUnwindSafe`; `dyn FileSystem` is not (interior mutability). This is the
+/// same shielding `Mutex<Bash>` gets for free — and sound here, since every FS
+/// operation is self-contained, so observing the FS after a panic is fine.
 struct SessionResource {
     bash: Mutex<bashkit::Bash>,
+    fs: AssertUnwindSafe<Arc<dyn FileSystem>>,
 }
 
 #[rustler::resource_impl]
@@ -116,8 +135,14 @@ fn session_new(
         builder = builder.env(key, value);
     }
 
+    let bash = builder.build();
+    // Grab the interpreter's *actual* post-build filesystem handle, so host
+    // read/write route through the same (possibly layered) FS scripts use.
+    let fs = bash.fs();
+
     ResourceArc::new(SessionResource {
-        bash: Mutex::new(builder.build()),
+        bash: Mutex::new(bash),
+        fs: AssertUnwindSafe(fs),
     })
 }
 
@@ -143,6 +168,77 @@ fn session_exec<'a>(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let result = runtime().block_on(async { bash.exec(&script).await });
     encode_exec_result(env, result)
+}
+
+/// Read a file from the session's virtual filesystem on the host's behalf,
+/// returning `{:ok, binary}` or `{:error, message}`. Operates on the shared FS
+/// `Arc` directly (no `bash` lock), so it works even mid-script.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn session_read_file<'a>(
+    env: Env<'a>,
+    session: ResourceArc<SessionResource>,
+    path: String,
+) -> Term<'a> {
+    let fs = Arc::clone(&session.fs.0);
+    let result = runtime().block_on(async move { fs.read_file(Path::new(&path)).await });
+
+    match result {
+        Ok(bytes) => match OwnedBinary::new(bytes.len()) {
+            Some(mut bin) => {
+                bin.as_mut_slice().copy_from_slice(&bytes);
+                let ok = rustler::types::atom::ok().encode(env);
+                let payload = bin.release(env).encode(env);
+                rustler::types::tuple::make_tuple(env, &[ok, payload])
+            }
+            // Honor the {:error, _} contract rather than panicking the caller
+            // if the BEAM can't allocate a binary for a very large file.
+            None => {
+                let error = rustler::types::atom::error().encode(env);
+                let msg = "could not allocate a binary for the file contents".encode(env);
+                rustler::types::tuple::make_tuple(env, &[error, msg])
+            }
+        },
+        Err(e) => {
+            let error = rustler::types::atom::error().encode(env);
+            let msg = e.to_string().encode(env);
+            rustler::types::tuple::make_tuple(env, &[error, msg])
+        }
+    }
+}
+
+/// Write a file into the session's virtual filesystem on the host's behalf
+/// (creating parent directories), returning `:ok` or `{:error, message}`. Also
+/// the seeding primitive behind `Session.new(files: ...)`.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn session_write_file<'a>(
+    env: Env<'a>,
+    session: ResourceArc<SessionResource>,
+    path: String,
+    content: Binary<'a>,
+) -> Term<'a> {
+    let fs = Arc::clone(&session.fs.0);
+    let bytes = content.as_slice().to_vec();
+    let result = runtime().block_on(async move {
+        // `write_file` requires the parent to exist; create it (mkdir -p) first
+        // so `write_file`/`Session.new(files: ...)` behave like a shell redirect
+        // into a fresh path.
+        let path = Path::new(&path);
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs.mkdir(parent, true).await?;
+            }
+        }
+        fs.write_file(path, &bytes).await
+    });
+
+    match result {
+        Ok(()) => rustler::types::atom::ok().encode(env),
+        Err(e) => {
+            let error = rustler::types::atom::error().encode(env);
+            let msg = e.to_string().encode(env);
+            rustler::types::tuple::make_tuple(env, &[error, msg])
+        }
+    }
 }
 
 rustler::init!("Elixir.ExBashkit.Native");
