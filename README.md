@@ -154,13 +154,34 @@ Available limits: `:max_commands`, `:max_loop_iterations`,
 `:max_total_loop_iterations`, `:max_function_depth`, `:max_input_bytes`,
 `:timeout_ms`. Each is optional and defaults to bashkit's value.
 
+## Network access
+
+A session cannot reach the network until you grant it an allowlist. `:allow_net`
+is default-deny — only requests matching a pattern's scheme, host, port, and
+path-prefix are permitted, and redirects are not followed.
+
+```elixir
+session = ExBashkit.Session.new(allow_net: ["https://api.example.com"])
+
+ExBashkit.Session.exec(session, "curl -s https://api.example.com/v1/health")
+# => {:ok, %ExBashkit.Result{exit_code: 0, ...}}
+
+ExBashkit.Session.exec(session, "curl -s https://evil.example")
+# => blocked (non-zero exit) — not on the allowlist
+```
+
+Requests to private/reserved IPs (loopback, RFC 1918, link-local, …) are blocked
+by default to prevent SSRF, even when the URL is allowlisted; pass
+`block_private_ips: false` to reach a localhost service deliberately. Use
+`allow_net: :all` only for fully trusted scripts.
+
 ## Why a virtual bash?
 
 | | Real `System.cmd/3` | ExBashkit |
 |---|---|---|
 | Spawns OS processes | yes (`fork`/`exec`) | **no** — pure in-process |
 | Host filesystem | full access | **virtual**, empty by default |
-| Network | unrestricted | **denied** by default (allowlist planned) |
+| Network | unrestricted | **denied** by default; opt-in per-URL allowlist |
 | Safe for untrusted input | no | **yes** |
 | Determinism / reproducibility | depends on host | high |
 
@@ -175,7 +196,8 @@ for its optional `python` builtin.
   explicitly mount them (`:read_only` / `:read_write`), with canonicalization,
   escape rejection, and a sensitive-path default-deny enforced by bashkit.
 - **Processes:** none. All commands are reimplemented Rust builtins.
-- **Network:** off by default; opt-in per-domain allowlist (planned).
+- **Network:** off by default; opt-in per-URL allowlist (`:allow_net`) with
+  redirect-blocking and private-IP/SSRF protection enforced by bashkit.
 - **Resource limits:** command count, loop iterations, recursion depth, input
   size, and a wall-clock timeout — tunable per session via `:limits`.
 - **Isolation:** each `exec/1` runs in an independent sandbox; a
@@ -206,7 +228,7 @@ See [`PORTING.md`](PORTING.md) for the staged plan. In brief:
 3. ✅ Virtual filesystem — in-memory seed/read/write, plus `:read_only` /
    `:read_write` host-directory mounts
 4. ✅ Resource limits (`:limits` — commands, loops, recursion, input size, timeout)
-5. ◻ Network allowlist
+5. ✅ Network allowlist (`:allow_net` — default-deny per-URL, SSRF protection)
 6. ◻ Elixir-defined custom builtins (call back into your app)
 7. ◻ Optional builtins: `sqlite` (Turso), `typescript` (ZapCode), `python` (monty)
 8. ◻ Snapshot / resume

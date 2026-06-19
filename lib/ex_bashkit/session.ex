@@ -42,6 +42,11 @@ defmodule ExBashkit.Session do
       though they fall under a directory bashkit refuses by default (see below).
     * `:limits` - a keyword list or map of resource limits enforced during
       execution (see "Resource limits" below).
+    * `:allow_net` - a list of URL patterns the `curl`/`wget`/`http` builtins may
+      reach, or `:all` to permit any host (see "Network access" below). Omitted,
+      the network is unreachable.
+    * `:block_private_ips` - whether to block requests that resolve to private or
+      reserved IP ranges (default `true`; see "Network access").
 
   ## Virtual filesystem
 
@@ -86,6 +91,31 @@ defmodule ExBashkit.Session do
   non-directory host path, or a host path bashkit refuses (sensitive with no
   covering allowlist entry).
 
+  ## Network access
+
+  By default a session cannot reach the network at all — `curl`, `wget`, and
+  `http` fail. Grant access with `:allow_net`, an allowlist of URL patterns:
+
+      session =
+        ExBashkit.Session.new(
+          allow_net: ["https://api.example.com", "https://cdn.example.com/assets"]
+        )
+
+      {:ok, result} = ExBashkit.Session.exec(session, "curl -s https://api.example.com/v1/health")
+
+  The allowlist is **default-deny**: only requests whose scheme, host, port, and
+  path-prefix match a pattern are permitted; everything else fails. Matching is
+  literal (no DNS resolution at match time), and redirects are not followed, so a
+  response cannot bounce a script to an unlisted host. `allow_net: :all` lifts the
+  allowlist entirely — only safe for fully trusted scripts.
+
+  Independently, requests that resolve to **private or reserved IP ranges**
+  (loopback, `10/8`, `172.16/12`, `192.168/16`, link-local, ULA, …) are blocked
+  by default, even if the URL is on the allowlist. This stops a script from
+  reaching internal services via SSRF / DNS-rebinding. To talk to a private
+  address on purpose (e.g. a localhost dev server), set `block_private_ips: false`
+  — understand the SSRF exposure before you do.
+
   ## Resource limits
 
   bashkit already bounds execution with safe defaults; `:limits` tightens them
@@ -126,6 +156,8 @@ defmodule ExBashkit.Session do
           | {:allowed_mount_paths, [Path.t()]}
           | {:limits,
              %{optional(limit_key()) => non_neg_integer()} | [{limit_key(), non_neg_integer()}]}
+          | {:allow_net, [String.t()] | :all}
+          | {:block_private_ips, boolean()}
 
   @typedoc "Access mode for a host directory mount."
   @type mount_mode :: :read_only | :read_write
@@ -157,9 +189,19 @@ defmodule ExBashkit.Session do
     mounts = opts |> Keyword.get(:mounts, []) |> normalize_mounts()
     allowed = opts |> Keyword.get(:allowed_mount_paths, []) |> Enum.map(&to_string/1)
     limits = opts |> Keyword.get(:limits) |> normalize_limits()
+    network = normalize_network(opts)
 
     session =
-      case ExBashkit.Native.session_new(env, cwd, username, hostname, mounts, allowed, limits) do
+      case ExBashkit.Native.session_new(
+             env,
+             cwd,
+             username,
+             hostname,
+             mounts,
+             allowed,
+             limits,
+             network
+           ) do
         {:ok, ref} -> %__MODULE__{ref: ref}
         {:error, message} -> raise ArgumentError, message
       end
@@ -244,6 +286,64 @@ defmodule ExBashkit.Session do
   @spec read_file(t(), Path.t()) :: {:ok, binary()} | {:error, String.t()}
   def read_file(%__MODULE__{ref: ref}, path) do
     ExBashkit.Native.session_read_file(ref, to_string(path))
+  end
+
+  # Normalize :allow_net / :block_private_ips into the plain map the NIF decodes:
+  #   %{}                                         -> no network (default deny)
+  #   %{allow_all: true, block_private_ips: bool} -> allow every host
+  #   %{patterns: [..], block_private_ips: bool}  -> allow only matching URLs
+  defp normalize_network(opts) do
+    block_private_ips = normalize_block_private_ips(Keyword.get(opts, :block_private_ips, true))
+
+    case Keyword.get(opts, :allow_net) do
+      nil ->
+        %{}
+
+      :all ->
+        %{allow_all: true, block_private_ips: block_private_ips}
+
+      patterns when is_list(patterns) ->
+        case Enum.map(patterns, &normalize_net_pattern/1) do
+          # An empty allowlist denies everything — same as no network.
+          [] -> %{}
+          patterns -> %{patterns: patterns, block_private_ips: block_private_ips}
+        end
+
+      other ->
+        raise ArgumentError,
+              ":allow_net must be a list of URL patterns or :all, got: #{inspect(other)}"
+    end
+  end
+
+  # bashkit matches an allowlist pattern against a request URL's scheme, host,
+  # port and path-prefix, so a pattern with no scheme or host can never match any
+  # real request — it would be a silent no-op (a deny that looks like a typo).
+  # Reject those loudly rather than hand bashkit an entry that allows nothing.
+  defp normalize_net_pattern(pattern) when is_binary(pattern) do
+    uri = URI.parse(pattern)
+
+    if blank?(uri.scheme) or blank?(uri.host) do
+      raise ArgumentError,
+            "each :allow_net pattern must be a URL like \"https://host[:port][/path]\", " <>
+              "got: #{inspect(pattern)}"
+    end
+
+    pattern
+  end
+
+  defp normalize_net_pattern(other) do
+    raise ArgumentError,
+          "each :allow_net pattern must be a URL string, got: #{inspect(other)}"
+  end
+
+  defp blank?(nil), do: true
+  defp blank?(""), do: true
+  defp blank?(_), do: false
+
+  defp normalize_block_private_ips(value) when is_boolean(value), do: value
+
+  defp normalize_block_private_ips(other) do
+    raise ArgumentError, ":block_private_ips must be true or false, got: #{inspect(other)}"
   end
 
   @limit_keys ~w(max_commands max_loop_iterations max_total_loop_iterations

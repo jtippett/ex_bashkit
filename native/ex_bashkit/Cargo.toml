@@ -11,6 +11,14 @@ name = "ex_bashkit"
 path = "src/lib.rs"
 crate-type = ["cdylib"]
 
+[features]
+# Re-export bashkit's network feature as our own so the `#[cfg(feature =
+# "http_client")]` gates in src/lib.rs are real (a `cfg(feature = ...)` checks
+# *this* crate's features, not the dependency's). On by default → baked into the
+# shipped NIF. Build with `--no-default-features` to drop reqwest/rustls.
+default = ["http_client"]
+http_client = ["bashkit/http_client"]
+
 [dependencies]
 rustler = "0.37"
 
@@ -23,12 +31,21 @@ rustler = "0.37"
 #   - "python" needs monty, which is a GIT dep upstream — NOT available from the
 #     crates.io build of bashkit. Enabling it requires a git source. Left off for now.
 #   - "sqlite" pulls turso (multi-MB) and needs tokio/rt-multi-thread.
-#   - "http_client", "typescript", "git", "ssh", "jq" are each opt-in.
+#   - "typescript", "git", "ssh", "jq" are each opt-in.
 #
 # "realfs" (no extra deps — just compiles bashkit's real-host-FS module) powers
 # host directory mounts (ExBashkit.Session :mounts). It is compiled into the
 # default build; mounting stays default-deny at runtime (no mount = no host
 # access). bashkit enforces all escape/canonicalization/sensitive-path checks.
+#
+# "http_client" (pulls reqwest + rustls/ring — a real HTTP/TLS dep tree, so a
+# meaningfully bigger build than realfs) powers the curl/wget/http builtins
+# behind ExBashkit.Session :allow_net. Network stays default-deny at runtime;
+# enabling the feature only makes an allowlist *configurable*. bashkit installs
+# the ring crypto provider itself and enforces all SSRF/allowlist checks. Baked
+# into the shipped NIF (decided with the user) so network capability ships with
+# every precompiled binary. http_client is enabled through *our* `default`
+# feature above (which maps to `bashkit/http_client`), so it stays cfg-gateable.
 bashkit = { version = "=0.11.0", default-features = false, features = ["realfs"] }
 # For local iteration against a checkout, comment the line above and use:
 # bashkit = { path = "../../../bashkit/crates/bashkit", default-features = false, features = ["realfs"] }

@@ -4,6 +4,16 @@
 
 ### Added
 
+- Network access. `ExBashkit.Session.new/1` accepts `:allow_net` — a list of URL
+  patterns the `curl`/`wget`/`http` builtins may reach, or `:all` for any host.
+  The allowlist is default-deny (a session with no `:allow_net` cannot reach the
+  network at all), matches scheme/host/port/path-prefix literally, and does not
+  follow redirects. Requests to private/reserved IP ranges are blocked by default
+  (SSRF protection); `:block_private_ips` (default `true`) controls this. The NIF
+  bundles bashkit's `http_client` feature (reqwest + rustls), so network support
+  ships in the precompiled binary; execution moves to a dirty-IO scheduler since
+  a networked script can block on a socket. Invalid `:allow_net`/`:block_private_ips`
+  values raise from `new/1`.
 - Resource limits. `ExBashkit.Session.new/1` accepts `:limits` (keyword list or
   map) to tighten bashkit's execution bounds for untrusted scripts:
   `:max_commands`, `:max_loop_iterations`, `:max_total_loop_iterations`,

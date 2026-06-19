@@ -168,15 +168,15 @@ Pause/resume *is* possible (phase 8), and serialization patterns from ExMonty's
 Each phase: implement the NIF(s), add the Elixir API + struct, write tests
 (`EXBASHKIT_BUILD=1 mix test`), update README + CHANGELOG, keep CI green.
 
-> **Status (Phases 1–4 shipped to `master`, CI green; 69 tests).** Everything
+> **Status (Phases 1–5 shipped to `master`, CI green; 78 tests).** Everything
 > below the line is built. The per-phase loop that's working: TDD (write the
 > failing test first) → implement → full gate (`mix test` + `mix format` +
 > `cargo fmt` + `cargo clippy -D warnings`) → dispatch the `superpowers:code-reviewer`
 > subagent → fold fixes → commit straight to `master` → watch CI. The reviewer
 > has earned its keep every phase (caught the `bash.fs()` layering bug, the mount
-> silent-skip, the limits overflow-revert). **Hex publish is deferred until the
-> whole port is done** (user publishes). All public surface lives on
-> `ExBashkit` (`exec/1`) and `ExBashkit.Session`.
+> silent-skip, the limits overflow-revert, the trivially-passing network tests).
+> **Hex publish is deferred until the whole port is done** (user publishes). All
+> public surface lives on `ExBashkit` (`exec/1`) and `ExBashkit.Session`.
 
 ### Phase 1 — Stateless `exec/1` ✅
 Done. `v0.1.0` tagged: GitHub release + 4 precompiled NIFs + checksum file all
@@ -214,13 +214,22 @@ each `exec`). A value past `usize::MAX` means "unlimited" (saturates).
   result tuple and breaks the full-struct doctests). A small, self-contained
   follow-up when wanted.
 
-### Phase 5 — Network allowlist (next)
-- `NetworkAllowlist` behind the `http_client` feature. Default deny. Switch the
-  relevant NIF to `DirtyIo` since real sockets can block.
-- **Decision to raise with the user first:** unlike `realfs` (a no-dep feature we
-  enabled by default), `http_client` likely pulls real HTTP/TLS dependencies →
-  meaningfully bigger build. Confirm enabling-by-default vs opt-in, same as the
-  realfs call.
+### Phase 5 — Network allowlist ✅
+Done. `Session.new(allow_net: ["https://api.example.com"] | :all)` maps to
+bashkit's `NetworkAllowlist` (default-deny; matches scheme/host/port/path-prefix;
+no redirects). `:block_private_ips` (default `true`) is bashkit's SSRF/private-IP
+guard. `http_client` (reqwest + rustls) is **baked into the shipped NIF** (user
+call) — declared as *our own* default Cargo feature `http_client =
+["bashkit/http_client"]` so the `#[cfg(feature = "http_client")]` gates are real
+(a bare `features = ["http_client"]` on the dep would NOT define a cfg for our
+crate — the gates would be dead and `.network()` never called; the first cut hit
+exactly this, caught by a failing loopback test). bashkit installs the `ring`
+crypto provider itself (idempotent), so we do nothing there. `session_exec` →
+`DirtyIo` (a networked script blocks on a socket); stateless `exec/1` stays
+`DirtyCpu` (no allowlist → can't block). Network tests use an in-test loopback
+`gen_tcp` server so the deny/allow paths are proven offline against a *reachable*
+host (a non-resolving hostname would make a "blocked" assertion pass trivially —
+the recurring trap).
 
 ### Phase 6 — Elixir-defined virtual executables & a dynamic VFS (high value)
 bashkit's runtime extension points are first-class — dynamic feeding is *not*

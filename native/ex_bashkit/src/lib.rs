@@ -12,6 +12,12 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use bashkit::{ExecutionLimits, FileSystem, RealFs, RealFsMode};
+// `NetworkAllowlist` and the `.network()` builder method are themselves gated on
+// bashkit's `http_client` feature, so our use of them must be too. We enable the
+// feature in Cargo.toml (it ships in the precompiled NIF), but cfg-gating keeps
+// the crate buildable with `--no-default-features` minus http_client.
+#[cfg(feature = "http_client")]
+use bashkit::NetworkAllowlist;
 use rustler::{Binary, Encoder, Env, NifResult, OwnedBinary, Resource, ResourceArc, Term};
 use tokio::runtime::Runtime;
 
@@ -95,9 +101,11 @@ fn encode_exec_result<'a>(env: Env<'a>, result: bashkit::Result<bashkit::ExecRes
 /// filesystem or environment carries across calls. Use a `Session` (below) when
 /// you need state to persist.
 ///
-/// Scheduled on a dirty CPU scheduler because execution is in-memory compute
-/// that can run longer than the ~1ms a regular NIF is allowed to hold the
-/// scheduler. Switch to `DirtyIo` once the network/http feature can block.
+/// Scheduled on a dirty **CPU** scheduler: this stateless path builds a default
+/// `Bash` with no network allowlist, so curl/wget are refused before any socket
+/// opens — execution is pure in-memory compute that can merely run longer than
+/// the ~1ms a regular NIF may hold a scheduler. (The stateful `session_exec`,
+/// which *can* be granted network access, uses `DirtyIo` for that reason.)
 #[rustler::nif(schedule = "DirtyCpu")]
 fn exec(env: Env<'_>, script: String) -> NifResult<Term<'_>> {
     let result = runtime().block_on(async {
@@ -165,6 +173,54 @@ fn decode_limits<'a>(env: Env<'a>, limits: Term<'a>) -> Option<ExecutionLimits> 
     }
 }
 
+/// Decode the Elixir `:allow_net`/`:block_private_ips` options (pre-normalized
+/// into a map on the Elixir side) into a `NetworkAllowlist`. Returns `None` when
+/// no network was configured, so the caller skips `.network()` entirely and the
+/// session stays default-deny (curl/wget cannot reach anything).
+///
+/// Shape of the map (Elixir guarantees it; we read defensively):
+///   - `%{}`                                         -> no network
+///   - `%{allow_all: true, block_private_ips: bool}` -> allow every host
+///   - `%{patterns: [..], block_private_ips: bool}`  -> allowlist those URLs
+///
+/// `block_private_ips` defaults to `true` (bashkit's SSRF default) if absent.
+#[cfg(feature = "http_client")]
+fn decode_network<'a>(env: Env<'a>, network: Term<'a>) -> Option<NetworkAllowlist> {
+    if !network.is_map() {
+        return None;
+    }
+
+    let get = |key: &str| -> Option<Term<'a>> {
+        let k = rustler::types::atom::Atom::from_str(env, key)
+            .ok()?
+            .encode(env);
+        network.map_get(k).ok()
+    };
+
+    let block_private_ips = get("block_private_ips")
+        .and_then(|t| t.decode::<bool>().ok())
+        .unwrap_or(true);
+
+    if get("allow_all").and_then(|t| t.decode::<bool>().ok()) == Some(true) {
+        return Some(NetworkAllowlist::allow_all().block_private_ips(block_private_ips));
+    }
+
+    let patterns: Vec<String> = get("patterns")
+        .and_then(|t| t.decode::<Vec<String>>().ok())
+        .unwrap_or_default();
+    // An empty allowlist denies everything, which is identical to "no network":
+    // leave `.network()` unset so the session reports a clean default-deny.
+    if patterns.is_empty() {
+        return None;
+    }
+
+    Some(
+        NetworkAllowlist::new()
+            .allow_many(patterns)
+            .block_private_ips(block_private_ips),
+    )
+}
+
 /// Encode a host-mount configuration error as `{:error, message}`.
 fn mount_error<'a>(env: Env<'a>, vfs: &str, host: &str, reason: &str) -> Term<'a> {
     let error = rustler::types::atom::error().encode(env);
@@ -193,12 +249,22 @@ fn session_new<'a>(
     mounts: Vec<(String, String, String)>,
     allowed_mount_paths: Vec<String>,
     limits: Term<'a>,
+    network: Term<'a>,
 ) -> Term<'a> {
     let mut builder = bashkit::Bash::builder();
 
     if let Some(limits) = decode_limits(env, limits) {
         builder = builder.limits(limits);
     }
+
+    // Configure the network allowlist (curl/wget/http) when the script asked for
+    // it. With `http_client` disabled there is no network surface, so ignore it.
+    #[cfg(feature = "http_client")]
+    if let Some(allowlist) = decode_network(env, network) {
+        builder = builder.network(allowlist);
+    }
+    #[cfg(not(feature = "http_client"))]
+    let _ = network;
 
     if let Some(username) = username {
         builder = builder.username(username);
@@ -277,9 +343,10 @@ fn session_new<'a>(
 /// any env/cwd/filesystem/function changes persist for the next call.
 ///
 /// The session `Mutex` is held for the whole script, serializing concurrent
-/// `session_exec` calls on the same session. Dirty CPU for the same reason as
-/// `exec`.
-#[rustler::nif(schedule = "DirtyCpu")]
+/// `session_exec` calls on the same session. Dirty **IO** for the same reason as
+/// `exec`: a networked script can block on a socket, which must not run on a
+/// dirty-CPU thread.
+#[rustler::nif(schedule = "DirtyIo")]
 fn session_exec<'a>(
     env: Env<'a>,
     session: ResourceArc<SessionResource>,
