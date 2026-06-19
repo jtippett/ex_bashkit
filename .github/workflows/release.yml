@@ -1,8 +1,10 @@
 name: Build precompiled NIFs
 
-# Push a tag (v0.1.0, v0.2.0, ...) to build NIFs for every target and attach
-# them to a GitHub release. AFTER this finishes, regenerate the checksum file
-# locally and `mix hex.publish` — see UPDATE_PROCEDURE.md.
+# Push a tag (v0.1.0, v0.2.0, ...) to: build NIFs for every target, attach them
+# to a GitHub release, generate the checksum file from those artifacts, and
+# publish to Hex. The `publish` job is gated by the `hex` environment, so it
+# pauses for a required-reviewer approval before anything ships. See
+# UPDATE_PROCEDURE.md.
 
 on:
   push:
@@ -89,3 +91,44 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*.tar.gz
+
+  # Generates the precompiled-NIF checksum file from the artifacts just attached
+  # to the GitHub release, then publishes to Hex. Gated by the `hex` environment:
+  # GitHub pauses here for a required reviewer to approve, so you still eyeball
+  # the release before anything ships. No manual checksum commit, no re-tag.
+  publish:
+    name: Publish to Hex
+    needs: release
+    runs-on: ubuntu-latest
+    environment: hex
+    env:
+      # Build the NIF locally so `mix compile` doesn't try to download a NIF
+      # whose checksum isn't generated yet (the classic chicken-and-egg).
+      EXBASHKIT_BUILD: "1"
+      HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "27.2"
+          elixir-version: "1.18.0"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Fetch dependencies
+        run: mix deps.get
+
+      - name: Generate checksums from the released artifacts
+        # Downloads each target's NIF from the GitHub release created above and
+        # writes checksum-Elixir.ExBashkit.Native.exs — the canonical way, so the
+        # format always matches what rustler_precompiled expects at fetch time.
+        run: mix rustler_precompiled.download ExBashkit.Native --all --print
+
+      - name: Publish package to Hex
+        run: mix hex.publish package --yes
+
+      - name: Publish docs to HexDocs
+        continue-on-error: true
+        run: mix hex.publish docs --yes
