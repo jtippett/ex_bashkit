@@ -11,7 +11,7 @@ use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use bashkit::FileSystem;
+use bashkit::{FileSystem, RealFs, RealFsMode};
 use rustler::{Binary, Encoder, Env, NifResult, OwnedBinary, Resource, ResourceArc, Term};
 use tokio::runtime::Runtime;
 
@@ -108,18 +108,33 @@ fn exec(env: Env<'_>, script: String) -> NifResult<Term<'_>> {
     Ok(encode_exec_result(env, result))
 }
 
-/// Build a persistent session from decoded builder options and return it as an
-/// opaque resource handle. Construction is infallible (`BashBuilder::build`
-/// returns a `Bash`, not a `Result`); option validation/normalization happens on
-/// the Elixir side. Dirty-scheduled because wiring up the interpreter's ~150
-/// builtins is more work than a regular NIF should do inline.
+/// Encode a host-mount configuration error as `{:error, message}`.
+fn mount_error<'a>(env: Env<'a>, vfs: &str, host: &str, reason: &str) -> Term<'a> {
+    let error = rustler::types::atom::error().encode(env);
+    let msg = format!("mount {vfs:?} -> {host:?}: {reason}").encode(env);
+    rustler::types::tuple::make_tuple(env, &[error, msg])
+}
+
+/// Build a persistent session from decoded builder options. Returns
+/// `{:ok, session}` or, if a host mount is misconfigured, `{:error, message}`.
+///
+/// Host mounts are validated eagerly with bashkit's own `RealFs::new` (which
+/// canonicalizes the host path and checks it is an existing directory) so a bad
+/// mount is a clean error rather than the silent skip the builder would do.
+/// bashkit still performs every security check at run time (path canonicalization,
+/// symlink-escape rejection, sensitive-path default-deny) — we only surface the
+/// common misconfiguration up front. Dirty-scheduled because wiring up the
+/// interpreter's ~150 builtins is more work than a regular NIF should do inline.
 #[rustler::nif(schedule = "DirtyCpu")]
-fn session_new(
+fn session_new<'a>(
+    env: Env<'a>,
     env_vars: Vec<(String, String)>,
     cwd: Option<String>,
     username: Option<String>,
     hostname: Option<String>,
-) -> ResourceArc<SessionResource> {
+    mounts: Vec<(String, String, String)>,
+    allowed_mount_paths: Vec<String>,
+) -> Term<'a> {
     let mut builder = bashkit::Bash::builder();
 
     if let Some(username) = username {
@@ -135,15 +150,64 @@ fn session_new(
         builder = builder.env(key, value);
     }
 
+    if !allowed_mount_paths.is_empty() {
+        builder = builder.allowed_mount_paths(allowed_mount_paths);
+    }
+
+    for (vfs, host, mode) in &mounts {
+        let real_mode = match mode.as_str() {
+            "read_only" => RealFsMode::ReadOnly,
+            "read_write" => RealFsMode::ReadWrite,
+            other => return mount_error(env, vfs, host, &format!("unknown mount mode {other:?}")),
+        };
+
+        // Validate the host path with bashkit's own RealFs (canonicalize + must
+        // be an existing directory). On success we discard it and let the builder
+        // re-create the mount during `build()`.
+        if let Err(e) = RealFs::new(host, real_mode) {
+            return mount_error(env, vfs, host, &e.to_string());
+        }
+
+        builder = match real_mode {
+            RealFsMode::ReadOnly => builder.mount_real_readonly_at(host, vfs),
+            RealFsMode::ReadWrite => builder.mount_real_readwrite_at(host, vfs),
+        };
+    }
+
     let bash = builder.build();
     // Grab the interpreter's *actual* post-build filesystem handle, so host
     // read/write route through the same (possibly layered) FS scripts use.
     let fs = bash.fs();
 
-    ResourceArc::new(SessionResource {
+    // bashkit *silently skips* mounts it refuses (a sensitive host path with no
+    // covering allowlist entry, an invalid mount point, or a dir removed since
+    // validation) — it only warns on stderr. Verify each mount point now exists,
+    // so a dropped mount is a clean error instead of a session where the mount
+    // silently isn't there. The freshly built base FS has no user vfs paths yet
+    // (file seeding happens later, Elixir-side), so a missing mount point means
+    // the mount was dropped. (Caveat: a skip whose vfs collides with a default
+    // dir like `/tmp` can't be distinguished this way; Elixir requires an
+    // absolute non-root vfs, which covers the common fresh-path case.)
+    for (vfs, host, _mode) in &mounts {
+        let present = runtime().block_on(async { fs.exists(Path::new(vfs)).await });
+        if !matches!(present, Ok(true)) {
+            return mount_error(
+                env,
+                vfs,
+                host,
+                "rejected by bashkit (sensitive host path without a covering \
+                 allowed_mount_paths entry, or an invalid mount point)",
+            );
+        }
+    }
+
+    let session = ResourceArc::new(SessionResource {
         bash: Mutex::new(bash),
         fs: AssertUnwindSafe(fs),
-    })
+    });
+
+    let ok = rustler::types::atom::ok().encode(env);
+    rustler::types::tuple::make_tuple(env, &[ok, session.encode(env)])
 }
 
 /// Execute `script` against an existing session, mutating it in place so that

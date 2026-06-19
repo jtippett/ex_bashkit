@@ -31,7 +31,9 @@ defmodule ExBashkit.Native do
   def exec(_script), do: :erlang.nif_error(:nif_not_loaded)
 
   # Sessions (persistent, stateful interpreters held as a resource).
-  def session_new(_env, _cwd, _username, _hostname), do: :erlang.nif_error(:nif_not_loaded)
+  def session_new(_env, _cwd, _username, _hostname, _mounts, _allowed_mount_paths),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   def session_exec(_session, _script), do: :erlang.nif_error(:nif_not_loaded)
   def session_read_file(_session, _path), do: :erlang.nif_error(:nif_not_loaded)
   def session_write_file(_session, _path, _content), do: :erlang.nif_error(:nif_not_loaded)

@@ -4,6 +4,13 @@
 
 ### Added
 
+- Host directory mounts. `ExBashkit.Session.new/1` accepts `:mounts` —
+  `{vfs_path, host_path, mode}` tuples (`:read_only` / `:read_write`) — mapping
+  real host directories into a sandbox, plus `:allowed_mount_paths` to opt into
+  bashkit's sensitive-path default-deny. bashkit enforces canonicalization and
+  symlink/`..` escape rejection; misconfigured mounts (unknown mode, missing or
+  non-directory host path) raise from `new/1`. (`:overlay` is intentionally
+  unsupported — bashkit has no real-FS overlay mode.)
 - Virtual filesystem access from Elixir. `ExBashkit.Session.write_file/3` and
   `read_file/2` place and retrieve files in a session's in-memory filesystem —
   shared with scripts, so the host can stage inputs and pull back results

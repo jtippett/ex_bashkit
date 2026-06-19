@@ -35,6 +35,11 @@ defmodule ExBashkit.Session do
       virtual filesystem before the first call, creating parent directories as
       needed. Content is any `t:iodata/0`. Equivalent to calling `write_file/3`
       for each entry.
+    * `:mounts` - a list of `{vfs_path, host_path, mode}` tuples mapping a real
+      host directory into the sandbox (see "Host mounts" below). `mode` is
+      `:read_only` or `:read_write`.
+    * `:allowed_mount_paths` - a list of host paths that may be mounted even
+      though they fall under a directory bashkit refuses by default (see below).
 
   ## Virtual filesystem
 
@@ -46,6 +51,38 @@ defmodule ExBashkit.Session do
       iex> {:ok, _} = ExBashkit.Session.exec(session, "wc -l < /in.txt > /out.txt")
       iex> ExBashkit.Session.read_file(session, "/out.txt")
       {:ok, "1\\n"}
+
+  ## Host mounts
+
+  By default nothing on the real host is reachable. The `:mounts` option maps a
+  real host directory into the sandbox's filesystem:
+
+      ExBashkit.Session.new(
+        mounts: [
+          {"/data", "/srv/app/data", :read_only},
+          {"/work", "/tmp/sandbox-work", :read_write}
+        ]
+      )
+
+    * `:read_only` — scripts can read host files; writes fail.
+    * `:read_write` — scripts can read **and modify** real host files. A footgun;
+      use a dedicated directory.
+
+  bashkit enforces all isolation: paths are canonicalized, `..` traversal and
+  symlinks that escape the mounted directory are rejected, so a mount of
+  `/srv/app/data` can never reach `/srv/app/secrets`.
+
+  By default bashkit **refuses to mount sensitive host locations** — `/etc`,
+  `/proc`, `/sys`, `/dev`, `/home`, `/Users`, `/private` (which on macOS includes
+  temp dirs under `/var/folders`), and paths containing `.ssh`/`.aws`/etc. To
+  mount under one deliberately, list a covering prefix in `:allowed_mount_paths`.
+  Note this is a *switch*, not additive: once you set `:allowed_mount_paths`, the
+  built-in sensitive-path denylist is **off** and the allowlist becomes the sole
+  gate — every mount's host path must then sit under some allowlisted prefix.
+
+  A misconfigured mount raises from `new/1` — unknown mode, a missing or
+  non-directory host path, or a host path bashkit refuses (sensitive with no
+  covering allowlist entry).
   """
 
   alias ExBashkit.Result
@@ -61,13 +98,20 @@ defmodule ExBashkit.Session do
           | {:username, String.t()}
           | {:hostname, String.t()}
           | {:files, %{optional(Path.t()) => iodata()} | [{Path.t(), iodata()}]}
+          | {:mounts, [{Path.t(), Path.t(), mount_mode()}]}
+          | {:allowed_mount_paths, [Path.t()]}
+
+  @typedoc "Access mode for a host directory mount."
+  @type mount_mode :: :read_only | :read_write
 
   @doc """
   Create a new persistent session, optionally seeding its initial state.
 
-  See the module doc for the supported `opts`. Construction is infallible;
-  malformed options raise (they are a programmer error). Raises `ArgumentError`
-  if a `:files` entry cannot be written (e.g. it violates a filesystem limit).
+  See the module doc for the supported `opts`. Construction is infallible for
+  the in-memory options; malformed options raise (they are a programmer error).
+  Raises `ArgumentError` if a `:files` entry cannot be written, or if a `:mounts`
+  entry is invalid (unknown mode, or a host path that is missing or not a
+  directory).
   """
   @spec new([option]) :: t()
   def new(opts \\ []) when is_list(opts) do
@@ -75,9 +119,14 @@ defmodule ExBashkit.Session do
     cwd = opts |> Keyword.get(:cwd) |> normalize_string()
     username = opts |> Keyword.get(:username) |> normalize_string()
     hostname = opts |> Keyword.get(:hostname) |> normalize_string()
+    mounts = opts |> Keyword.get(:mounts, []) |> normalize_mounts()
+    allowed = opts |> Keyword.get(:allowed_mount_paths, []) |> Enum.map(&to_string/1)
 
-    ref = ExBashkit.Native.session_new(env, cwd, username, hostname)
-    session = %__MODULE__{ref: ref}
+    session =
+      case ExBashkit.Native.session_new(env, cwd, username, hostname, mounts, allowed) do
+        {:ok, ref} -> %__MODULE__{ref: ref}
+        {:error, message} -> raise ArgumentError, message
+      end
 
     opts |> Keyword.get(:files, %{}) |> seed_files(session)
     session
@@ -121,6 +170,8 @@ defmodule ExBashkit.Session do
   `path` is resolved from the filesystem **root**, independent of the session's
   working directory (the cwd lives in the interpreter, not the filesystem). Pass
   absolute paths; a relative path like `"out.txt"` is treated as `"/out.txt"`.
+  If `path` falls under a `:read_write` host mount, the write reaches the **real
+  host disk** (and fails under a `:read_only` mount), just as it would for a script.
 
   ## Examples
 
@@ -144,7 +195,8 @@ defmodule ExBashkit.Session do
   is a raw binary, so it round-trips arbitrary (including non-UTF-8) content.
 
   As with `write_file/3`, `path` is resolved from the filesystem **root**,
-  independent of the session's working directory; pass absolute paths.
+  independent of the session's working directory; pass absolute paths. A `path`
+  under a host mount reads the **real host file**.
 
   ## Examples
 
@@ -156,6 +208,32 @@ defmodule ExBashkit.Session do
   @spec read_file(t(), Path.t()) :: {:ok, binary()} | {:error, String.t()}
   def read_file(%__MODULE__{ref: ref}, path) do
     ExBashkit.Native.session_read_file(ref, to_string(path))
+  end
+
+  # Stringify each {vfs, host, mode} mount tuple for the NIF; `to_string/1`
+  # accepts the mode as an atom (:read_only) or a string. The NIF validates the
+  # mode and host path; here we validate the shape and the vfs mount point.
+  defp normalize_mounts(mounts) when is_list(mounts), do: Enum.map(mounts, &normalize_mount/1)
+
+  defp normalize_mounts(other) do
+    raise ArgumentError,
+          ":mounts must be a list of {vfs_path, host_path, mode} tuples, got: #{inspect(other)}"
+  end
+
+  defp normalize_mount({vfs, host, mode}) do
+    vfs = to_string(vfs)
+
+    unless String.starts_with?(vfs, "/") and vfs != "/" do
+      raise ArgumentError,
+            "mount vfs_path must be an absolute path other than \"/\", got: #{inspect(vfs)}"
+    end
+
+    {vfs, to_string(host), to_string(mode)}
+  end
+
+  defp normalize_mount(other) do
+    raise ArgumentError,
+          "each :mounts entry must be a {vfs_path, host_path, mode} tuple, got: #{inspect(other)}"
   end
 
   # Seed initial files by writing each one; a failed seed is a programmer error.

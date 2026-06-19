@@ -101,8 +101,42 @@ ExBashkit.Session.read_file(session, "/out.txt")
 - `ExBashkit.Session.read_file(session, path)` returns `{:ok, binary}` — including
   files a script wrote — round-tripping arbitrary (even non-UTF-8) bytes.
 
-The filesystem is still fully virtual — no host path is reachable. (Mounting real
-host directories with explicit access modes is the next step; see the roadmap.)
+By default the filesystem is fully virtual — no host path is reachable.
+
+## Host mounts
+
+To give a sandbox controlled access to real host directories, map them in with
+explicit access modes:
+
+```elixir
+session =
+  ExBashkit.Session.new(
+    mounts: [
+      {"/data", "/srv/app/data", :read_only},
+      {"/work", "/tmp/sandbox-work", :read_write}
+    ]
+  )
+
+{:ok, _} = ExBashkit.Session.exec(session, "wc -l /data/*.csv > /work/counts.txt")
+# /tmp/sandbox-work/counts.txt now exists on the real disk.
+```
+
+- `:read_only` — scripts read host files; writes fail.
+- `:read_write` — scripts read **and modify** real host files (a footgun — use a
+  dedicated directory).
+
+bashkit enforces the isolation: paths are canonicalized, and `..` traversal or
+symlinks that escape the mounted directory are rejected — a mount of
+`/srv/app/data` can't reach `/srv/app/secrets`. Sensitive host locations
+(`/etc`, `/home`, `/Users`, `/private`, paths with `.ssh`/`.aws`, …) are
+**refused by default**; pass `:allowed_mount_paths` to opt in (note: setting it
+switches bashkit from the built-in denylist to allowlist-only gating). On macOS,
+temp dirs under `/var/folders` canonicalize beneath `/private`, so mounting them
+needs an allowlist entry. A refused or misconfigured mount raises from `new/1`.
+
+> `:overlay` mounts (host-backed, copy-on-write) are intentionally **not**
+> supported: bashkit has no real-FS overlay mode, and ExBashkit only exposes what
+> bashkit does. For copy-on-write behavior, use the in-memory filesystem.
 
 ## Why a virtual bash?
 
@@ -121,8 +155,9 @@ for its optional `python` builtin.
 
 ## Security model
 
-- **Filesystem:** in-memory virtual FS; no host paths are reachable. (Mounting
-  host directories with explicit modes is planned — see the roadmap.)
+- **Filesystem:** in-memory virtual FS; no host paths are reachable unless you
+  explicitly mount them (`:read_only` / `:read_write`), with canonicalization,
+  escape rejection, and a sensitive-path default-deny enforced by bashkit.
 - **Processes:** none. All commands are reimplemented Rust builtins.
 - **Network:** off by default; opt-in per-domain allowlist (planned).
 - **Resource limits:** command count, loop iterations, output size, recursion
@@ -152,8 +187,8 @@ See [`PORTING.md`](PORTING.md) for the staged plan. In brief:
 
 1. ✅ Stateless `exec/1` (skeleton, proves the toolchain)
 2. ✅ Persistent sessions (state across calls)
-3. ◧ Virtual filesystem — in-memory seed/read/write ✅; host-dir mounts
-   (`:read_only` / `:read_write` / `:overlay`) next
+3. ✅ Virtual filesystem — in-memory seed/read/write, plus `:read_only` /
+   `:read_write` host-directory mounts
 4. ◻ Resource limits
 5. ◻ Network allowlist
 6. ◻ Elixir-defined custom builtins (call back into your app)

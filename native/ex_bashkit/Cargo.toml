@@ -24,9 +24,14 @@ rustler = "0.37"
 #     crates.io build of bashkit. Enabling it requires a git source. Left off for now.
 #   - "sqlite" pulls turso (multi-MB) and needs tokio/rt-multi-thread.
 #   - "http_client", "typescript", "git", "ssh", "jq" are each opt-in.
-bashkit = { version = "=0.11.0", default-features = false }
+#
+# "realfs" (no extra deps — just compiles bashkit's real-host-FS module) powers
+# host directory mounts (ExBashkit.Session :mounts). It is compiled into the
+# default build; mounting stays default-deny at runtime (no mount = no host
+# access). bashkit enforces all escape/canonicalization/sensitive-path checks.
+bashkit = { version = "=0.11.0", default-features = false, features = ["realfs"] }
 # For local iteration against a checkout, comment the line above and use:
-# bashkit = { path = "../../../bashkit/crates/bashkit", default-features = false }
+# bashkit = { path = "../../../bashkit/crates/bashkit", default-features = false, features = ["realfs"] }
 
 # bashkit's `exec` is async (tokio). We host a single shared runtime and
 # block_on it from inside dirty NIFs. See src/lib.rs.
