@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## 0.1.0
+
 ### Added
 
 - Initial project scaffold: Rustler-precompiled NIF wrapper around
