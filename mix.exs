@@ -35,13 +35,14 @@ defmodule ExBashkit.MixProject do
     ]
   end
 
-  # Optional: enables the `python` builtin (`Session.new(python: true)`). Consumers
-  # opt in by adding `:ex_monty` to their *own* deps; ExBashkit gates on it at
-  # runtime via `Code.ensure_loaded?/1` and compiles fine without it.
+  # `:ex_monty` enables the `python` builtin (`Session.new(python: true)`). It is a
+  # runtime-optional dependency: consumers opt in by adding `:ex_monty` to their
+  # own deps and ExBashkit gates on it at runtime via `Code.ensure_loaded?/1`.
   #
-  # For our own dev/test we prefer the sibling checkout when present (so the two
-  # libraries can be co-developed); otherwise (e.g. CI) we fetch the published
-  # release, which ships a precompiled NIF — no Rust build of ex_monty/monty.
+  # We use the sibling checkout when present (co-development); otherwise we fetch
+  # the published release, which ships a precompiled NIF (no Rust build needed).
+  # Both forms make ex_monty present at compile time, so the python code compiles
+  # cleanly with no special-casing.
   defp ex_monty_dep do
     if File.dir?(Path.expand("../ex_monty", __DIR__)) do
       {:ex_monty, path: "../ex_monty", optional: true}
