@@ -175,6 +175,35 @@ by default to prevent SSRF, even when the URL is allowlisted; pass
 `block_private_ips: false` to reach a localhost service deliberately. Use
 `allow_net: :all` only for fully trusted scripts.
 
+## Custom builtins
+
+Register Elixir functions as **virtual executables** the script can call. A
+script line `name args…` calls back into your application, which returns the
+command's output — the way to expose capabilities you control (a database query,
+a lookup, an approval step) without real process or network access.
+
+```elixir
+session =
+  ExBashkit.Session.new(
+    builtins: %{
+      "kv_get" => fn call ->
+        case Map.fetch(%{"answer" => "42"}, hd(call.args)) do
+          {:ok, value} -> {:ok, value <> "\n"}
+          :error -> {:error, "no such key\n"}
+        end
+      end
+    }
+  )
+
+ExBashkit.Session.exec(session, "echo \"the answer is $(kv_get answer)\"")
+# => {:ok, %ExBashkit.Result{stdout: "the answer is 42\n", exit_code: 0}}
+```
+
+A builtin receives `%{args:, stdin:, env:}` and returns `{:ok, iodata}` (stdout,
+exit 0), `{:error, iodata}` (stderr, exit 1), or a full `%ExBashkit.Result{}`. A
+handler that raises or exceeds `:builtin_timeout_ms` fails only that command, not
+the session.
+
 ## Why a virtual bash?
 
 | | Real `System.cmd/3` | ExBashkit |
@@ -229,10 +258,11 @@ See [`PORTING.md`](PORTING.md) for the staged plan. In brief:
    `:read_write` host-directory mounts
 4. ✅ Resource limits (`:limits` — commands, loops, recursion, input size, timeout)
 5. ✅ Network allowlist (`:allow_net` — default-deny per-URL, SSRF protection)
-6. ◻ Elixir-defined custom builtins (call back into your app)
-7. ◻ Optional builtins: `sqlite` (Turso), `typescript` (ZapCode), `python` (monty)
-8. ◻ Snapshot / resume
-9. ◻ LLM tool contract helpers
+6. ✅ Elixir-defined custom builtins (`:builtins` — call back into your app)
+7. ◻ Dynamic Elixir-backed filesystem (same back-call bridge as custom builtins)
+8. ◻ Optional builtins: `sqlite` (Turso), `typescript` (ZapCode), `python` (monty)
+9. ◻ Snapshot / resume
+10. ◻ LLM tool contract helpers
 
 ## Relationship to bashkit
 

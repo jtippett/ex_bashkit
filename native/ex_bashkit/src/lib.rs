@@ -7,19 +7,32 @@
 //! builtins that call back into Elixir, snapshot/resume) is the porting work —
 //! see PORTING.md for the staged plan and the lessons carried over from ExMonty.
 
+use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
-use bashkit::{ExecutionLimits, FileSystem, RealFs, RealFsMode};
+use bashkit::{
+    async_trait, Builtin, BuiltinContext, ExecResult, ExecutionExtensions, ExecutionLimits,
+    FileSystem, RealFs, RealFsMode,
+};
 // `NetworkAllowlist` and the `.network()` builder method are themselves gated on
 // bashkit's `http_client` feature, so our use of them must be too. We enable the
 // feature in Cargo.toml (it ships in the precompiled NIF), but cfg-gating keeps
 // the crate buildable with `--no-default-features` minus http_client.
 #[cfg(feature = "http_client")]
 use bashkit::NetworkAllowlist;
-use rustler::{Binary, Encoder, Env, NifResult, OwnedBinary, Resource, ResourceArc, Term};
+use rustler::{
+    Binary, Encoder, Env, LocalPid, NifResult, OwnedBinary, OwnedEnv, Resource, ResourceArc, Term,
+};
 use tokio::runtime::Runtime;
+use tokio::sync::oneshot;
+
+mod atoms {
+    rustler::atoms! { bashkit_call }
+}
 
 /// A single process-wide multi-thread tokio runtime.
 ///
@@ -68,6 +81,207 @@ struct SessionResource {
 
 #[rustler::resource_impl]
 impl Resource for SessionResource {}
+
+// --- Elixir-defined custom builtins (the back-call bridge) ------------------
+//
+// A custom builtin runs *inside* bashkit's async execution. To service it from
+// Elixir we do a round-trip: the builtin parks a reply channel in a global
+// table keyed by a request id, sends `{:bashkit_call, req_id, name, args,
+// stdin, env}` to a per-exec handler pid, and `await`s the channel. An Elixir
+// handler process computes the result and calls the `builtin_reply` NIF, which
+// pushes it back into the channel. Awaiting (vs blocking) frees the tokio worker
+// while the host thinks; only the outer dirty-scheduler thread stays pinned for
+// the script, which is inherent to the synchronous `exec/2` API.
+
+/// The result an Elixir handler sends back for one builtin invocation.
+struct BuiltinReply {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    exit_code: i32,
+}
+
+/// Pending builtin invocations awaiting an Elixir reply, keyed by request id.
+fn pending_calls() -> &'static Mutex<HashMap<u64, oneshot::Sender<BuiltinReply>>> {
+    static PENDING: OnceLock<Mutex<HashMap<u64, oneshot::Sender<BuiltinReply>>>> = OnceLock::new();
+    PENDING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Monotonic request-id source for back-calls (process-wide, never reused).
+fn next_request_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Removes a request's slot from `pending_calls` on *every* exit path of the
+/// builtin future — normal return, error, timeout, and crucially **cancellation**
+/// (bashkit's execution timeout drops the whole `execute` future mid-`await`,
+/// which would otherwise leak the parked sender forever). Idempotent with the
+/// removal `builtin_reply` does, so whichever runs first wins.
+struct PendingCleanup(u64);
+
+impl Drop for PendingCleanup {
+    fn drop(&mut self) {
+        pending_calls()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.0);
+    }
+}
+
+/// Per-execution context for back-calls, threaded into `exec_with_extensions`
+/// and read by a builtin via `ctx.execution_extension::<CallTarget>()`. The pid
+/// is *this exec's* handler process; the timeout bounds a single back-call.
+#[derive(Clone, Copy)]
+struct CallTarget {
+    handler: LocalPid,
+    timeout: Duration,
+}
+
+/// Build an `ExecResult` from raw stdout/stderr bytes and an exit code. Sets
+/// `stdout_bytes` so binary output round-trips exactly, and a lossy `stdout`
+/// string for the text path (pipes, captures).
+fn builtin_exec_result(stdout: Vec<u8>, stderr: Vec<u8>, exit_code: i32) -> ExecResult {
+    ExecResult {
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stdout_bytes: Some(stdout),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        exit_code,
+        ..Default::default()
+    }
+}
+
+/// A failed back-call surfaced as the builtin's own non-zero exit + stderr, so a
+/// misbehaving host never wedges the session — just fails that command.
+fn builtin_error_result(message: String, exit_code: i32) -> ExecResult {
+    builtin_exec_result(Vec::new(), message.into_bytes(), exit_code)
+}
+
+/// A virtual executable backed by an Elixir function. Registered by *name* at
+/// build time; the closure itself lives entirely on the Elixir side.
+struct ElixirBuiltin {
+    name: String,
+}
+
+#[async_trait]
+impl Builtin for ElixirBuiltin {
+    async fn execute(&self, ctx: BuiltinContext<'_>) -> bashkit::Result<ExecResult> {
+        let Some(target) = ctx.execution_extension::<CallTarget>().copied() else {
+            // No handler wired for this exec — shouldn't happen (we always set
+            // one), but fail the command rather than panic.
+            return Ok(builtin_error_result(
+                format!(
+                    "{}: no Elixir handler is available for this execution",
+                    self.name
+                ),
+                1,
+            ));
+        };
+
+        // Snapshot the call context into owned data we can ship to Elixir.
+        let args: Vec<String> = ctx.args.to_vec();
+        let stdin: Vec<u8> = ctx.stdin.map(|s| s.as_bytes().to_vec()).unwrap_or_default();
+        let env: Vec<(String, String)> = ctx
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        let req_id = next_request_id();
+        let (tx, rx) = oneshot::channel::<BuiltinReply>();
+        pending_calls()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(req_id, tx);
+        // From here on, every exit path (return, timeout, or this future being
+        // dropped on a script-timeout cancellation) must clear the slot.
+        let _cleanup = PendingCleanup(req_id);
+
+        // Send `{:bashkit_call, req_id, name, args, stdin, env}` to the handler.
+        //
+        // `OwnedEnv::send_and_clear` *panics* if called from a BEAM-managed
+        // thread, and this future is polled on the dirty-scheduler thread (via
+        // `block_on`). So hand the send to a tokio blocking thread (not
+        // VM-managed) and await it. All captured data is owned and `Send`.
+        let handler = target.handler;
+        let name = self.name.clone();
+        let send_outcome = tokio::task::spawn_blocking(move || {
+            let mut owned = OwnedEnv::new();
+            owned.send_and_clear(&handler, |env_| {
+                let stdin_term = match OwnedBinary::new(stdin.len()) {
+                    Some(mut bin) => {
+                        bin.as_mut_slice().copy_from_slice(&stdin);
+                        bin.release(env_).encode(env_)
+                    }
+                    None => "".encode(env_),
+                };
+                rustler::types::tuple::make_tuple(
+                    env_,
+                    &[
+                        atoms::bashkit_call().encode(env_),
+                        req_id.encode(env_),
+                        name.encode(env_),
+                        args.encode(env_),
+                        stdin_term,
+                        env.encode(env_),
+                    ],
+                )
+            })
+        })
+        .await;
+
+        if !matches!(send_outcome, Ok(Ok(()))) {
+            return Ok(builtin_error_result(
+                format!("{}: Elixir handler is unavailable", self.name),
+                1,
+            ));
+        }
+
+        // Await the reply, bounded by the back-call timeout. `_cleanup` clears the
+        // table slot on every branch below (and on cancellation).
+        match tokio::time::timeout(target.timeout, rx).await {
+            Ok(Ok(reply)) => Ok(builtin_exec_result(
+                reply.stdout,
+                reply.stderr,
+                reply.exit_code,
+            )),
+            // Defensive: `rx` only errors if the sender were dropped without a
+            // reply. The current design never does that (the slot holds the
+            // sender until `builtin_reply` consumes it), so in practice a dead
+            // handler surfaces as the timeout below — but handle it cleanly.
+            Ok(Err(_)) => Ok(builtin_error_result(
+                format!("{}: Elixir handler stopped before replying", self.name),
+                1,
+            )),
+            Err(_elapsed) => Ok(builtin_error_result(
+                format!(
+                    "{}: builtin timed out after {}ms",
+                    self.name,
+                    target.timeout.as_millis()
+                ),
+                124,
+            )),
+        }
+    }
+}
+
+/// Deliver an Elixir handler's result for one back-call into the waiting
+/// builtin. A fast, regular NIF: a map lookup plus a non-blocking channel send.
+/// A stale `req_id` (already timed out) is silently dropped.
+#[rustler::nif]
+fn builtin_reply(req_id: u64, stdout: Binary, stderr: Binary, exit_code: i32) -> rustler::Atom {
+    if let Some(tx) = pending_calls()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&req_id)
+    {
+        let _ = tx.send(BuiltinReply {
+            stdout: stdout.as_slice().to_vec(),
+            stderr: stderr.as_slice().to_vec(),
+            exit_code,
+        });
+    }
+    rustler::types::atom::ok()
+}
 
 /// Encode a bashkit run as `{:ok, {stdout, stderr, exit_code}}`, or an
 /// interpreter/parse error as `{:error, message}`. Shared by the stateless and
@@ -250,6 +464,7 @@ fn session_new<'a>(
     allowed_mount_paths: Vec<String>,
     limits: Term<'a>,
     network: Term<'a>,
+    builtin_names: Vec<String>,
 ) -> Term<'a> {
     let mut builder = bashkit::Bash::builder();
 
@@ -265,6 +480,14 @@ fn session_new<'a>(
     }
     #[cfg(not(feature = "http_client"))]
     let _ = network;
+
+    // Register an Elixir-backed virtual executable for each name. The closures
+    // live on the Elixir side; each `ElixirBuiltin` knows only its own name and
+    // calls back per invocation (see the bridge above).
+    for name in builtin_names {
+        let builtin = ElixirBuiltin { name: name.clone() };
+        builder = builder.builtin(name, Box::new(builtin));
+    }
 
     if let Some(username) = username {
         builder = builder.username(username);
@@ -351,6 +574,8 @@ fn session_exec<'a>(
     env: Env<'a>,
     session: ResourceArc<SessionResource>,
     script: String,
+    handler: LocalPid,
+    builtin_timeout_ms: u64,
 ) -> Term<'a> {
     // Recover from a poisoned lock rather than bricking the session forever: if a
     // prior `exec` panicked inside bashkit, the guard was dropped mid-unwind and
@@ -360,7 +585,17 @@ fn session_exec<'a>(
         .bash
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let result = runtime().block_on(async { bash.exec(&script).await });
+
+    // Thread this exec's back-call target (handler pid + per-call timeout) in as
+    // an execution extension, so any custom builtin can reach the right Elixir
+    // handler. Harmless when the session has no custom builtins (nothing reads it).
+    let target = CallTarget {
+        handler,
+        timeout: Duration::from_millis(builtin_timeout_ms),
+    };
+    let extensions = ExecutionExtensions::new().with(target);
+
+    let result = runtime().block_on(async { bash.exec_with_extensions(&script, extensions).await });
     encode_exec_result(env, result)
 }
 

@@ -28,8 +28,8 @@ defmodule ExBashkit.MixProject do
 
   defp deps do
     [
-      {:rustler, "~> 0.37", optional: true},
-      {:rustler_precompiled, "~> 0.8"},
+      {:rustler, "~> 0.38", optional: true},
+      {:rustler_precompiled, "~> 0.9"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false}
     ]
   end

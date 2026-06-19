@@ -20,7 +20,7 @@ default = ["http_client"]
 http_client = ["bashkit/http_client"]
 
 [dependencies]
-rustler = "0.37"
+rustler = "0.38"
 
 # bashkit IS published to crates.io (unlike monty, which is git-only), so we pin
 # an exact semver. Bump deliberately via UPDATE_PROCEDURE.md.

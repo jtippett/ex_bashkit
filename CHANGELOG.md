@@ -4,6 +4,15 @@
 
 ### Added
 
+- Custom builtins. `ExBashkit.Session.new/1` accepts `:builtins` — a map of
+  `name => fun` registering Elixir-defined virtual executables a script invokes
+  as `name args…`. Each builtin is a 1-arity function receiving `%{args, stdin,
+  env}` and returning `{:ok, iodata}` (stdout/exit 0), `{:error, iodata}`
+  (stderr/exit 1), or a full `%ExBashkit.Result{}`. The call is a blocking
+  Rust→Elixir round-trip serviced by a short-lived per-`exec/2` process; a
+  handler that raises or exceeds `:builtin_timeout_ms` (default 30_000; exit 124)
+  fails only that command, not the session. A builtin must not call `exec/2` on
+  the same session (reentrancy deadlock); driving a different session is fine.
 - Network access. `ExBashkit.Session.new/1` accepts `:allow_net` — a list of URL
   patterns the `curl`/`wget`/`http` builtins may reach, or `:all` for any host.
   The allowlist is default-deny (a session with no `:allow_net` cannot reach the
@@ -38,6 +47,11 @@
   `ExBashkit.Session.new/1` seeds initial state via `:env`, `:cwd`, `:username`,
   and `:hostname` options. Each session is an independent sandbox and serializes
   its own calls.
+
+### Changed
+
+- Updated `rustler` to 0.38 (Rust crate and Elixir dep) and `rustler_precompiled`
+  to 0.9, aligning the previously skewed Rust/Elixir rustler versions.
 
 ## 0.1.0
 

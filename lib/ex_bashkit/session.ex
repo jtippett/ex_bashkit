@@ -47,6 +47,10 @@ defmodule ExBashkit.Session do
       the network is unreachable.
     * `:block_private_ips` - whether to block requests that resolve to private or
       reserved IP ranges (default `true`; see "Network access").
+    * `:builtins` - a map of `name => fun` registering Elixir-defined virtual
+      executables a script can invoke (see "Custom builtins" below).
+    * `:builtin_timeout_ms` - how long a single custom-builtin back-call may run
+      before it is abandoned (positive integer, default `30_000`).
 
   ## Virtual filesystem
 
@@ -137,14 +141,65 @@ defmodule ExBashkit.Session do
 
   Count limits must be non-negative integers (a value past the platform maximum
   means "unlimited"); unknown keys raise `ArgumentError`.
+
+  ## Custom builtins
+
+  `:builtins` registers Elixir-defined **virtual executables**: a script line
+  `name args…` calls back into your application, which computes the command's
+  output. This is how a sandbox reaches capabilities you control — a database
+  query, a key/value lookup, an approval prompt — without giving the script real
+  process or network access.
+
+      session =
+        ExBashkit.Session.new(
+          builtins: %{
+            "kv_get" => fn call ->
+              case Store.fetch(hd(call.args)) do
+                {:ok, value} -> {:ok, value <> "\\n"}
+                :error -> {:error, "no such key\\n"}
+              end
+            end
+          }
+        )
+
+      {:ok, %ExBashkit.Result{stdout: "42\\n"}} =
+        ExBashkit.Session.exec(session, "total=$(kv_get answer); echo $total")
+
+  Each builtin is a **1-arity function** receiving one map:
+
+    * `:args` - the command's arguments (a list of strings), excluding the name.
+    * `:stdin` - input piped from the previous command (`""` if none).
+    * `:env` - the session's environment variables (a `%{String.t => String.t}`).
+
+  It returns a **tagged** result:
+
+    * `{:ok, iodata}` - success; the iodata becomes stdout, exit code `0`.
+    * `{:error, iodata}` - failure; the iodata becomes stderr, exit code `1`.
+    * `%ExBashkit.Result{}` - full control over stdout, stderr, and exit code.
+
+  Anything else is treated as a contract violation: the command fails (exit `1`)
+  with a descriptive stderr message rather than crashing the session.
+
+  **Robustness.** A builtin that raises, or runs longer than `:builtin_timeout_ms`
+  (exit `124`), fails only *that command* — the session stays usable.
+
+  **No reentrancy.** A builtin handler must not call `exec/2` on the *same*
+  session; that exec already holds the session's lock, so the call would block.
+  Driving a *different* session from inside a builtin is fine. Each `exec/2`
+  services back-calls from a short-lived process, so builtins run outside the
+  caller's process and must not rely on its process dictionary or `self()`.
   """
 
   alias ExBashkit.Result
 
   @enforce_keys [:ref]
-  defstruct [:ref]
+  defstruct [:ref, builtins: %{}, builtin_timeout_ms: 30_000]
 
-  @opaque t :: %__MODULE__{ref: reference()}
+  @opaque t :: %__MODULE__{
+            ref: reference(),
+            builtins: %{optional(String.t()) => (map() -> term())},
+            builtin_timeout_ms: pos_integer()
+          }
 
   @type option ::
           {:env, %{optional(String.t() | atom()) => String.t()} | keyword()}
@@ -158,6 +213,8 @@ defmodule ExBashkit.Session do
              %{optional(limit_key()) => non_neg_integer()} | [{limit_key(), non_neg_integer()}]}
           | {:allow_net, [String.t()] | :all}
           | {:block_private_ips, boolean()}
+          | {:builtins, %{optional(String.t()) => (map() -> term())}}
+          | {:builtin_timeout_ms, pos_integer()}
 
   @typedoc "Access mode for a host directory mount."
   @type mount_mode :: :read_only | :read_write
@@ -190,6 +247,10 @@ defmodule ExBashkit.Session do
     allowed = opts |> Keyword.get(:allowed_mount_paths, []) |> Enum.map(&to_string/1)
     limits = opts |> Keyword.get(:limits) |> normalize_limits()
     network = normalize_network(opts)
+    builtins = opts |> Keyword.get(:builtins, %{}) |> normalize_builtins()
+
+    builtin_timeout_ms =
+      opts |> Keyword.get(:builtin_timeout_ms, 30_000) |> normalize_builtin_timeout()
 
     session =
       case ExBashkit.Native.session_new(
@@ -200,10 +261,14 @@ defmodule ExBashkit.Session do
              mounts,
              allowed,
              limits,
-             network
+             network,
+             Map.keys(builtins)
            ) do
-        {:ok, ref} -> %__MODULE__{ref: ref}
-        {:error, message} -> raise ArgumentError, message
+        {:ok, ref} ->
+          %__MODULE__{ref: ref, builtins: builtins, builtin_timeout_ms: builtin_timeout_ms}
+
+        {:error, message} ->
+          raise ArgumentError, message
       end
 
     opts |> Keyword.get(:files, %{}) |> seed_files(session)
@@ -227,13 +292,20 @@ defmodule ExBashkit.Session do
       "/tmp\\n"
   """
   @spec exec(t(), String.t()) :: {:ok, Result.t()} | {:error, String.t()}
-  def exec(%__MODULE__{ref: ref}, script) when is_binary(script) do
-    case ExBashkit.Native.session_exec(ref, script) do
-      {:ok, {stdout, stderr, exit_code}} ->
-        {:ok, %Result{stdout: stdout, stderr: stderr, exit_code: exit_code}}
+  def exec(%__MODULE__{ref: ref, builtins: builtins, builtin_timeout_ms: timeout}, script)
+      when is_binary(script) do
+    {handler, cleanup} = start_builtin_handler(builtins)
 
-      {:error, message} ->
-        {:error, message}
+    try do
+      case ExBashkit.Native.session_exec(ref, script, handler, timeout) do
+        {:ok, {stdout, stderr, exit_code}} ->
+          {:ok, %Result{stdout: stdout, stderr: stderr, exit_code: exit_code}}
+
+        {:error, message} ->
+          {:error, message}
+      end
+    after
+      cleanup.()
     end
   end
 
@@ -344,6 +416,100 @@ defmodule ExBashkit.Session do
 
   defp normalize_block_private_ips(other) do
     raise ArgumentError, ":block_private_ips must be true or false, got: #{inspect(other)}"
+  end
+
+  # --- custom builtin back-call handling ------------------------------------
+
+  # A session with no custom builtins needs no handler process; the pid we hand
+  # the NIF is never used (no builtin can fire), so the caller's own pid is fine.
+  defp start_builtin_handler(builtins) when map_size(builtins) == 0 do
+    {self(), fn -> :ok end}
+  end
+
+  # Otherwise spawn a short-lived process to service back-calls for the duration
+  # of one `exec/2`. It is linked so it dies with the caller (no orphan), and we
+  # unlink-then-kill on teardown so our own kill never propagates to the caller.
+  defp start_builtin_handler(builtins) do
+    pid = spawn_link(fn -> builtin_handler_loop(builtins) end)
+
+    cleanup = fn ->
+      Process.unlink(pid)
+      Process.exit(pid, :kill)
+    end
+
+    {pid, cleanup}
+  end
+
+  defp builtin_handler_loop(builtins) do
+    receive do
+      {:bashkit_call, req_id, name, args, stdin, env_pairs} ->
+        {stdout, stderr, exit_code} = invoke_builtin(builtins, name, args, stdin, env_pairs)
+        ExBashkit.Native.builtin_reply(req_id, stdout, stderr, exit_code)
+        builtin_handler_loop(builtins)
+    end
+  end
+
+  # Run one builtin and normalize its result to {stdout, stderr, exit_code}. A
+  # raise, throw, or malformed return becomes a failed command (exit 1) with a
+  # descriptive stderr — never a crashed handler or a wedged session.
+  defp invoke_builtin(builtins, name, args, stdin, env_pairs) do
+    call = %{args: args, stdin: stdin, env: Map.new(env_pairs)}
+
+    try do
+      builtins |> Map.fetch!(name) |> apply([call]) |> normalize_builtin_return(name)
+    rescue
+      e -> {"", "#{name}: builtin raised: #{Exception.message(e)}\n", 1}
+    catch
+      kind, reason -> {"", "#{name}: builtin #{kind}: #{inspect(reason)}\n", 1}
+    end
+  end
+
+  defp normalize_builtin_return({:ok, io}, _name), do: {IO.iodata_to_binary(io), "", 0}
+  defp normalize_builtin_return({:error, io}, _name), do: {"", IO.iodata_to_binary(io), 1}
+
+  defp normalize_builtin_return(%Result{stdout: out, stderr: err, exit_code: code}, _name)
+       when is_integer(code) do
+    # Mask to a byte like a real shell (exit codes are mod 256). This is also a
+    # safety net: the reply NIF takes an i32, so an out-of-range integer here
+    # would otherwise raise in the handler process and (being linked) take the
+    # caller down — exactly the "a builtin must never wedge the session" hole.
+    {IO.iodata_to_binary(out || ""), IO.iodata_to_binary(err || ""), Bitwise.band(code, 0xFF)}
+  end
+
+  defp normalize_builtin_return(other, name) do
+    {"", "#{name}: builtin returned an invalid value: #{inspect(other)}\n", 1}
+  end
+
+  # Validate the :builtins map: string names mapped to arity-1 functions.
+  defp normalize_builtins(builtins) when is_map(builtins) or is_list(builtins) do
+    map = Map.new(builtins)
+
+    Enum.each(map, fn {name, fun} ->
+      # A builtin name must be a single shell token — a name with whitespace
+      # could never be invoked from a script, so reject it loudly rather than
+      # register a dead entry.
+      unless is_binary(name) and Regex.match?(~r/^\S+$/, name) do
+        raise ArgumentError,
+              "builtin name must be a non-empty string with no whitespace, got: #{inspect(name)}"
+      end
+
+      unless is_function(fun, 1) do
+        raise ArgumentError,
+              "builtin #{inspect(name)} must be a 1-arity function, got: #{inspect(fun)}"
+      end
+    end)
+
+    map
+  end
+
+  defp normalize_builtins(other) do
+    raise ArgumentError, ":builtins must be a map of name => function, got: #{inspect(other)}"
+  end
+
+  defp normalize_builtin_timeout(ms) when is_integer(ms) and ms > 0, do: ms
+
+  defp normalize_builtin_timeout(other) do
+    raise ArgumentError, ":builtin_timeout_ms must be a positive integer, got: #{inspect(other)}"
   end
 
   @limit_keys ~w(max_commands max_loop_iterations max_total_loop_iterations

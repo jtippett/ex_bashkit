@@ -168,15 +168,18 @@ Pause/resume *is* possible (phase 8), and serialization patterns from ExMonty's
 Each phase: implement the NIF(s), add the Elixir API + struct, write tests
 (`EXBASHKIT_BUILD=1 mix test`), update README + CHANGELOG, keep CI green.
 
-> **Status (Phases 1–5 shipped to `master`, CI green; 78 tests).** Everything
+> **Status (Phases 1–6 shipped to `master`, CI green; 98 tests).** Everything
 > below the line is built. The per-phase loop that's working: TDD (write the
 > failing test first) → implement → full gate (`mix test` + `mix format` +
 > `cargo fmt` + `cargo clippy -D warnings`) → dispatch the `superpowers:code-reviewer`
 > subagent → fold fixes → commit straight to `master` → watch CI. The reviewer
 > has earned its keep every phase (caught the `bash.fs()` layering bug, the mount
-> silent-skip, the limits overflow-revert, the trivially-passing network tests).
-> **Hex publish is deferred until the whole port is done** (user publishes). All
-> public surface lives on `ExBashkit` (`exec/1`) and `ExBashkit.Session`.
+> silent-skip, the limits overflow-revert, the trivially-passing network tests,
+> the builtin pending-call leak + exit-code overflow crash). **Hex publish is
+> deferred until the whole port is done** (user publishes). All public surface
+> lives on `ExBashkit` (`exec/1`) and `ExBashkit.Session`. rustler is on 0.38
+> (Rust + Elixir aligned); `release.yml`'s `nif-2.15` artifact name stays valid
+> on OTP 27 but re-verify it at release time.
 
 ### Phase 1 — Stateless `exec/1` ✅
 Done. `v0.1.0` tagged: GitHub release + 4 precompiled NIFs + checksum file all
@@ -231,34 +234,44 @@ crypto provider itself (idempotent), so we do nothing there. `session_exec` →
 host (a non-resolving hostname would make a "blocked" assertion pass trivially —
 the recurring trap).
 
-### Phase 6 — Elixir-defined virtual executables & a dynamic VFS (high value)
-bashkit's runtime extension points are first-class — dynamic feeding is *not*
-limited to static seeding:
+### Phase 6 — Elixir-defined virtual executables (custom builtins) ✅
+Done. `Session.new(builtins: %{"name" => fn call -> ... end})` registers virtual
+executables a script invokes as `name args…`. The closures live on the Elixir
+side; Rust registers one `ElixirBuiltin` per *name* and, on invocation, does the
+**back-call**: park a `tokio::oneshot` in a global `req_id`-keyed table, send
+`{:bashkit_call, req_id, name, args, stdin, env}` to a per-exec **handler
+process**, `await` the reply (an `await`, not `block_in_place` — frees the tokio
+worker). A `builtin_reply` NIF pushes the result back. Contract: `{:ok, io}` |
+`{:error, io}` | `%Result{}`; raise/bad-shape/timeout → exit 1 (124) + stderr,
+session stays usable. Design + the load-bearing details: **`docs/plans/2026-06-19-custom-builtins-design.md`**.
 
-- **Virtual executables:** register an `async` `Builtin` via
-  `.builtin("name", ...)`. A script line `db_query "..."` then invokes your
-  Rust code. This is the canonical back-call mechanism (e.g. an `http` builtin
-  that asks your app to approve each request — monty-style mediation, recovered).
-- **Dynamic virtual filesystem:** `FileSystem` is a trait with `async`
-  `read_file`/`write_file`/`read_dir`. Implement a backend that generates
-  content on demand or proxies reads to Elixir — files don't have to exist
-  ahead of time. Static seeding of `InMemoryFs` is just the zero-bridge option.
+Hard-won specifics (don't re-derive):
+- `OwnedEnv::send_and_clear` **panics on a BEAM-managed thread**; the builtin
+  future is polled on the dirty-scheduler thread (via `block_on`), so the send
+  goes through `tokio::task::spawn_blocking` (a non-VM thread).
+- The handler pid rides per-exec as a bashkit `ExecutionExtensions` value, read
+  via `ctx.execution_extension::<CallTarget>()` — that's how a builtin registered
+  once at build time finds *this* exec's reply target.
+- **Cancellation leak (reviewer-caught):** bashkit enforces its own `:timeout_ms`
+  by wrapping the run in `tokio::time::timeout` and **dropping** the future. A
+  builtin parked mid-`await` is dropped, so the table slot must be freed on
+  *drop* — a `PendingCleanup(req_id)` RAII guard, not just the explicit paths.
+- **exit_code is masked to a byte** Elixir-side (`Bitwise.band(code, 0xFF)`): the
+  reply NIF takes `i32`, so an out-of-range `%Result{exit_code}` would otherwise
+  raise in the (linked) handler and kill the caller.
+- **No reentrancy:** a builtin must not `exec/2` the *same* session (it holds the
+  lock). A *different* session is fine. The back-call timeout breaks an accidental
+  same-session deadlock; it doesn't permanently pin a thread.
+- Handler process is `spawn_link`ed then `unlink`+`:kill`ed on teardown (in an
+  `after`) — orphan-safe if the caller dies, and the kill never reaches the caller.
 
-**The bridge (the one real cost, shared by both):** the trait methods run
-*inside* the async execution that we're already `block_on`-ing. To reach Elixir,
-do a **blocking round-trip**: `OwnedEnv` + `send` to a registered pid, then block
-on a reply channel; an Elixir handler computes and a tiny delivery NIF pushes the
-result back into the channel. Notes that keep this sane:
-- You **don't** need elaborate async-to-Elixir plumbing. The `async fn` can call
-  a plain *synchronous* blocking bridge function (wrap it in
-  `tokio::task::block_in_place` to avoid stalling the worker). bashkit also
-  exposes a synchronous `SyncToolExec` callback type for the agent-tool layer
-  (phase 9).
-- **No reentrancy:** the Elixir handler must not call back into the *same*
-  (Mutex-locked) session, or you deadlock. Make that a hard rule in the contract.
-- The round-trip **pins a dirty scheduler thread for the script's duration** —
-  so bound concurrency / pool sessions (the durable consequence from §2b).
-- Design the handler contract to mirror `ExBashkit.Sandbox`-style dispatch.
+### Phase 6b — Dynamic Elixir-backed filesystem (next, reuses the bridge)
+`FileSystem` is a trait with `async` `read_file`/`write_file`/`read_dir`/`exists`/
+`mkdir`/… Implement a backend that proxies to Elixir so files are generated on
+demand. Reuses the exact back-call machinery from Phase 6 (the `req_id` table,
+`builtin_reply`-style delivery, per-exec handler pid, `PendingCleanup`) — but
+across ~6 methods on the FS hot path, so mind per-call cost and the same
+no-reentrancy rule. Required feature, just sequenced after builtins.
 
 ### Phase 7 — Optional embedded interpreters
 - `sqlite` (Turso), `typescript` (ZapCode), `python` (monty — **git-dep

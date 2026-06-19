@@ -102,11 +102,18 @@ A misbehaving host builtin must never corrupt or wedge the session.
 - **Raises / bad-shape return** → `H` rescues and replies exit `1` + a stderr
   message (`name: builtin raised: …`). The script *continues*; it's a failed
   command, not a dead session.
-- **Hangs** → the bridge `await`s, so bashkit's `:timeout_ms` (await-points/fuel)
-  can't interrupt a parked oneshot. A dedicated **back-call timeout** covers it:
-  on expiry the builtin returns exit `124` + a stderr note, and `H` is killed on
-  teardown. Default **30_000 ms**, overridable per session via
+- **Hangs** → a dedicated **back-call timeout** covers a handler that never
+  replies: on expiry the builtin returns exit `124` + a stderr note, and `H` is
+  killed on teardown. Default **30_000 ms**, overridable per session via
   `:builtin_timeout_ms` (a DB-query builtin may outlive a tight script timeout).
+  - **Correction (caught in review):** bashkit *also* enforces its own execution
+    `:timeout_ms` by wrapping the whole run in `tokio::time::timeout` and
+    **dropping** the future on expiry. If that fires while a builtin is parked on
+    the reply channel, our `execute` future is dropped mid-`await` — so the
+    pending-call slot must be cleared on **drop**, not just on our own timeout
+    path, or the parked sender leaks forever. A `PendingCleanup(req_id)` RAII
+    guard held for the lifetime of `execute` handles every exit path (return,
+    our timeout, and cancellation) idempotently with `builtin_reply`'s removal.
 - **Reentrancy (hard rule)** → a builtin handler must **not** call `exec/2` on the
   *same* session; it would block on the session lock the in-flight exec holds.
   Calling a *different* session is fine. Documented loudly.
