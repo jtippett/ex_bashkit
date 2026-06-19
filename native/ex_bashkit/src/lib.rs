@@ -31,7 +31,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
 
 mod atoms {
-    rustler::atoms! { bashkit_call, bashkit_fs, ok_bytes, ok_list, ok_stat }
+    rustler::atoms! { bashkit_call, bashkit_fs, ok_bytes, ok_list, ok_stat, dir, file, symlink }
 }
 
 /// A single process-wide multi-thread tokio runtime.
@@ -189,6 +189,10 @@ impl Builtin for ElixirBuiltin {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+        // The interpreter's current working directory — not an exported env var,
+        // so a builtin can't get it from `env`. Threaded through so builtins (the
+        // `python` builtin in particular) can resolve relative paths.
+        let cwd: String = ctx.cwd.to_string_lossy().into_owned();
 
         let req_id = next_request_id();
         let (tx, rx) = oneshot::channel::<BuiltinReply>();
@@ -200,7 +204,7 @@ impl Builtin for ElixirBuiltin {
         // dropped on a script-timeout cancellation) must clear the slot.
         let _cleanup = PendingCleanup(req_id);
 
-        // Send `{:bashkit_call, req_id, name, args, stdin, env}` to the handler.
+        // Send `{:bashkit_call, req_id, name, args, stdin, env, cwd}` to the handler.
         //
         // `OwnedEnv::send_and_clear` *panics* if called from a BEAM-managed
         // thread, and this future is polled on the dirty-scheduler thread (via
@@ -227,6 +231,7 @@ impl Builtin for ElixirBuiltin {
                         args.encode(env_),
                         stdin_term,
                         env.encode(env_),
+                        cwd.encode(env_),
                     ],
                 )
             })
@@ -1049,6 +1054,125 @@ fn session_write_file<'a>(
             rustler::types::tuple::make_tuple(env, &[error, msg])
         }
     }
+}
+
+/// Map a bashkit `FileType` to the atom the Elixir side uses.
+fn file_type_atom(ft: bashkit::FileType) -> rustler::Atom {
+    match ft {
+        bashkit::FileType::Directory => atoms::dir(),
+        bashkit::FileType::Symlink => atoms::symlink(),
+        _ => atoms::file(),
+    }
+}
+
+/// Encode `:ok` / `{:error, message}` for the unit-returning FS host primitives.
+fn encode_fs_unit(env: Env<'_>, result: bashkit::Result<()>) -> Term<'_> {
+    match result {
+        Ok(()) => rustler::types::atom::ok().encode(env),
+        Err(e) => {
+            let error = rustler::types::atom::error().encode(env);
+            let msg = e.to_string().encode(env);
+            rustler::types::tuple::make_tuple(env, &[error, msg])
+        }
+    }
+}
+
+/// `stat` a path in the session's filesystem, returning `{:ok, type, size}`
+/// (`type` is `:file`/`:dir`/`:symlink`) or `{:error, message}`. Lock-free on the
+/// shared FS `Arc`, like `session_read_file`.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn session_stat<'a>(env: Env<'a>, session: ResourceArc<SessionResource>, path: String) -> Term<'a> {
+    let fs = Arc::clone(&session.fs.0);
+    let result = runtime().block_on(async move { fs.stat(Path::new(&path)).await });
+
+    match result {
+        Ok(meta) => {
+            let ok = rustler::types::atom::ok().encode(env);
+            let ty = file_type_atom(meta.file_type).encode(env);
+            let size = meta.size.encode(env);
+            rustler::types::tuple::make_tuple(env, &[ok, ty, size])
+        }
+        Err(e) => {
+            let error = rustler::types::atom::error().encode(env);
+            let msg = e.to_string().encode(env);
+            rustler::types::tuple::make_tuple(env, &[error, msg])
+        }
+    }
+}
+
+/// List a directory in the session's filesystem, returning
+/// `{:ok, [{name, type}]}` or `{:error, message}`.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn session_list_dir<'a>(
+    env: Env<'a>,
+    session: ResourceArc<SessionResource>,
+    path: String,
+) -> Term<'a> {
+    let fs = Arc::clone(&session.fs.0);
+    let result = runtime().block_on(async move { fs.read_dir(Path::new(&path)).await });
+
+    match result {
+        Ok(entries) => {
+            let ok = rustler::types::atom::ok().encode(env);
+            let list: Vec<Term> = entries
+                .into_iter()
+                .map(|e| {
+                    let name = e.name.encode(env);
+                    let ty = file_type_atom(e.metadata.file_type).encode(env);
+                    rustler::types::tuple::make_tuple(env, &[name, ty])
+                })
+                .collect();
+            rustler::types::tuple::make_tuple(env, &[ok, list.encode(env)])
+        }
+        Err(e) => {
+            let error = rustler::types::atom::error().encode(env);
+            let msg = e.to_string().encode(env);
+            rustler::types::tuple::make_tuple(env, &[error, msg])
+        }
+    }
+}
+
+/// Create a directory in the session's filesystem (`recursive` ≈ `mkdir -p`),
+/// returning `:ok` or `{:error, message}`.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn session_mkdir<'a>(
+    env: Env<'a>,
+    session: ResourceArc<SessionResource>,
+    path: String,
+    recursive: bool,
+) -> Term<'a> {
+    let fs = Arc::clone(&session.fs.0);
+    let result = runtime().block_on(async move { fs.mkdir(Path::new(&path), recursive).await });
+    encode_fs_unit(env, result)
+}
+
+/// Remove a file or directory from the session's filesystem (`recursive` to
+/// remove a non-empty directory), returning `:ok` or `{:error, message}`.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn session_remove<'a>(
+    env: Env<'a>,
+    session: ResourceArc<SessionResource>,
+    path: String,
+    recursive: bool,
+) -> Term<'a> {
+    let fs = Arc::clone(&session.fs.0);
+    let result = runtime().block_on(async move { fs.remove(Path::new(&path), recursive).await });
+    encode_fs_unit(env, result)
+}
+
+/// Rename/move a path within the session's filesystem, returning `:ok` or
+/// `{:error, message}`.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn session_rename<'a>(
+    env: Env<'a>,
+    session: ResourceArc<SessionResource>,
+    from: String,
+    to: String,
+) -> Term<'a> {
+    let fs = Arc::clone(&session.fs.0);
+    let result =
+        runtime().block_on(async move { fs.rename(Path::new(&from), Path::new(&to)).await });
+    encode_fs_unit(env, result)
 }
 
 /// Capture the session's interpreter state (shell vars/env/cwd/functions plus

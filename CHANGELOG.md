@@ -4,6 +4,23 @@
 
 ### Added
 
+- Sandboxed `python` builtin. `ExBashkit.Session.new(python: true)` registers
+  `python`/`python3` virtual executables that run sandboxed Python (via the
+  optional `:ex_monty` dependency) **sharing the session's virtual filesystem** —
+  a file a bash step writes, the Python reads, and vice versa. Supports
+  `python file.py`, `python -c "…"`, and a program piped on stdin; Python's
+  `pathlib`/`os` filesystem operations are routed to the session, while every
+  other effect (network, clocks) is denied. A Python error or timeout fails only
+  that command, not the session. Opt-in by adding `:ex_monty` to your deps;
+  ExBashkit compiles and runs without it, and `python: true` raises a helpful
+  error if it is absent. (Limitations: no `sys.argv`; `pathlib.Path` I/O, not
+  `open()`.) See `ExBashkit.Python`.
+- Host filesystem primitives on `ExBashkit.Session`: `stat/2`, `list_dir/2`,
+  `mkdir/3`, `remove/3`, `rename/3` — lock-free introspection/mutation of a
+  session's (shared) virtual filesystem, alongside the existing
+  `read_file/2`/`write_file/3`.
+- Custom builtins now receive the shell's working directory as `:cwd` in their
+  call map (`%{args, stdin, env, cwd}`), since bashkit does not export `PWD`.
 - Snapshot & resume. `ExBashkit.Session.snapshot/2` captures a session's shell
   state (variables, env, cwd, aliases, functions) and in-memory filesystem
   contents as a binary; `ExBashkit.Session.restore/3` loads it back into a

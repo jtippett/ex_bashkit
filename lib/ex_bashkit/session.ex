@@ -55,6 +55,9 @@ defmodule ExBashkit.Session do
     * `:virtual_fs` - a map of `mount_path => backend` mounting Elixir-backed
       filesystems whose reads and writes are serviced by your application (see
       "Virtual filesystem backends" below and `ExBashkit.VirtualFs`).
+    * `:python` - `true` (or `[name: ...]`/`[names: [...]]`) to register a
+      sandboxed `python`/`python3` builtin that shares the session filesystem.
+      Requires the optional `:ex_monty` dependency (see `ExBashkit.Python`).
 
   ## Virtual filesystem
 
@@ -253,6 +256,7 @@ defmodule ExBashkit.Session do
           | {:builtins, %{optional(String.t()) => (map() -> term())}}
           | {:builtin_timeout_ms, pos_integer()}
           | {:virtual_fs, %{optional(Path.t()) => virtual_fs_spec()}}
+          | {:python, boolean() | keyword()}
 
   @typedoc "Access mode for a host directory mount."
   @type mount_mode :: :read_only | :read_write
@@ -292,6 +296,10 @@ defmodule ExBashkit.Session do
 
     virtual_fs = opts |> Keyword.get(:virtual_fs, %{}) |> normalize_virtual_fs()
 
+    python = opts |> Keyword.get(:python) |> ExBashkit.Python.normalize()
+    python_names = ExBashkit.Python.names(python)
+    validate_python_names!(python_names, builtins)
+
     session =
       case ExBashkit.Native.session_new(
              env,
@@ -302,15 +310,23 @@ defmodule ExBashkit.Session do
              allowed,
              limits,
              network,
-             Map.keys(builtins),
+             Map.keys(builtins) ++ python_names,
              Map.keys(virtual_fs)
            ) do
         {:ok, ref} ->
-          %__MODULE__{
+          base = %__MODULE__{
             ref: ref,
             builtins: builtins,
             builtin_timeout_ms: builtin_timeout_ms,
             virtual_fs: virtual_fs
+          }
+
+          # The python builtin captures the (built) session so its handler can
+          # reach the shared FS via the lock-free read_file/write_file/etc.
+          %{
+            base
+            | builtins:
+                Map.merge(builtins, ExBashkit.Python.builtins(base, builtin_timeout_ms, python))
           }
 
         {:error, message} ->
@@ -319,6 +335,18 @@ defmodule ExBashkit.Session do
 
     opts |> Keyword.get(:files, %{}) |> seed_files(session)
     session
+  end
+
+  defp validate_python_names!(python_names, builtins) do
+    case Enum.filter(python_names, &Map.has_key?(builtins, &1)) do
+      [] ->
+        :ok
+
+      clashes ->
+        raise ArgumentError,
+              "python builtin name(s) #{inspect(clashes)} collide with a :builtins entry; " <>
+                "rename the custom builtin or set python: [name: ...]"
+    end
   end
 
   @doc """
@@ -417,6 +445,94 @@ defmodule ExBashkit.Session do
   @spec read_file(t(), Path.t()) :: {:ok, binary()} | {:error, String.t()}
   def read_file(%__MODULE__{ref: ref}, path) do
     ExBashkit.Native.session_read_file(ref, to_string(path))
+  end
+
+  @typedoc "A filesystem entry's kind, as reported by `stat/2` and `list_dir/2`."
+  @type fs_type :: :file | :dir | :symlink
+
+  @doc """
+  Return metadata for `path` in the session's filesystem.
+
+  `{:ok, %{type: :file | :dir | :symlink, size: non_neg_integer()}}`, or
+  `{:error, message}` if the path does not exist. Like `read_file/2`, it resolves
+  from the filesystem root and reads through host mounts; it is lock-free, so it
+  also works while a script is running.
+
+  ## Examples
+
+      iex> session = ExBashkit.Session.new()
+      iex> {:ok, _} = ExBashkit.Session.exec(session, "printf 12345 > /f")
+      iex> ExBashkit.Session.stat(session, "/f")
+      {:ok, %{type: :file, size: 5}}
+  """
+  @spec stat(t(), Path.t()) ::
+          {:ok, %{type: fs_type(), size: non_neg_integer()}} | {:error, String.t()}
+  def stat(%__MODULE__{ref: ref}, path) do
+    case ExBashkit.Native.session_stat(ref, to_string(path)) do
+      {:ok, type, size} -> {:ok, %{type: type, size: size}}
+      {:error, message} -> {:error, message}
+    end
+  end
+
+  @doc """
+  List the entries of directory `path` in the session's filesystem.
+
+  `{:ok, [{name, :file | :dir | :symlink}]}` (names are the immediate children,
+  not full paths), or `{:error, message}` if `path` is not a readable directory.
+
+  ## Examples
+
+      iex> session = ExBashkit.Session.new()
+      iex> {:ok, _} = ExBashkit.Session.exec(session, "mkdir /d; echo x > /d/a.txt")
+      iex> ExBashkit.Session.list_dir(session, "/d")
+      {:ok, [{"a.txt", :file}]}
+  """
+  @spec list_dir(t(), Path.t()) :: {:ok, [{String.t(), fs_type()}]} | {:error, String.t()}
+  def list_dir(%__MODULE__{ref: ref}, path) do
+    ExBashkit.Native.session_list_dir(ref, to_string(path))
+  end
+
+  @doc """
+  Create directory `path` in the session's filesystem.
+
+  Returns `:ok` or `{:error, message}`. With `parents: true` it creates any
+  missing parent directories (like `mkdir -p`) and succeeds if the directory
+  already exists; without it, a missing parent is an error.
+
+  ## Options
+
+    * `:parents` - create missing parents (default `false`).
+  """
+  @spec mkdir(t(), Path.t(), keyword()) :: :ok | {:error, String.t()}
+  def mkdir(%__MODULE__{ref: ref}, path, opts \\ []) when is_list(opts) do
+    parents = opts |> Keyword.get(:parents, false) |> truthy!(:parents)
+    ExBashkit.Native.session_mkdir(ref, to_string(path), parents)
+  end
+
+  @doc """
+  Remove `path` from the session's filesystem.
+
+  Returns `:ok` or `{:error, message}`. Removing a non-empty directory requires
+  `recursive: true`.
+
+  ## Options
+
+    * `:recursive` - remove a directory and its contents (default `false`).
+  """
+  @spec remove(t(), Path.t(), keyword()) :: :ok | {:error, String.t()}
+  def remove(%__MODULE__{ref: ref}, path, opts \\ []) when is_list(opts) do
+    recursive = opts |> Keyword.get(:recursive, false) |> truthy!(:recursive)
+    ExBashkit.Native.session_remove(ref, to_string(path), recursive)
+  end
+
+  @doc """
+  Rename/move `from` to `to` within the session's filesystem.
+
+  Returns `:ok` or `{:error, message}`.
+  """
+  @spec rename(t(), Path.t(), Path.t()) :: :ok | {:error, String.t()}
+  def rename(%__MODULE__{ref: ref}, from, to) do
+    ExBashkit.Native.session_rename(ref, to_string(from), to_string(to))
   end
 
   @doc """
@@ -618,8 +734,8 @@ defmodule ExBashkit.Session do
 
   defp handler_loop(builtins, virtual_fs) do
     receive do
-      {:bashkit_call, req_id, name, args, stdin, env_pairs} ->
-        {stdout, stderr, exit_code} = invoke_builtin(builtins, name, args, stdin, env_pairs)
+      {:bashkit_call, req_id, name, args, stdin, env_pairs, cwd} ->
+        {stdout, stderr, exit_code} = invoke_builtin(builtins, name, args, stdin, env_pairs, cwd)
         ExBashkit.Native.builtin_reply(req_id, stdout, stderr, exit_code)
         handler_loop(builtins, virtual_fs)
 
@@ -633,8 +749,8 @@ defmodule ExBashkit.Session do
   # Run one builtin and normalize its result to {stdout, stderr, exit_code}. A
   # raise, throw, or malformed return becomes a failed command (exit 1) with a
   # descriptive stderr — never a crashed handler or a wedged session.
-  defp invoke_builtin(builtins, name, args, stdin, env_pairs) do
-    call = %{args: args, stdin: stdin, env: Map.new(env_pairs)}
+  defp invoke_builtin(builtins, name, args, stdin, env_pairs, cwd) do
+    call = %{args: args, stdin: stdin, env: Map.new(env_pairs), cwd: cwd}
 
     try do
       builtins |> Map.fetch!(name) |> apply([call]) |> normalize_builtin_return(name)

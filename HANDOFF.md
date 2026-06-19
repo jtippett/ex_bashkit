@@ -10,9 +10,9 @@ uncommitted scratch — keep it refreshed as you go.
 
 ## TL;DR — where things stand
 
-**Phases 1–6b + 8 are shipped to `master`, CI green, 137 tests.** The library
-wraps bashkit faithfully (we vendor no execution logic — every semantic comes
-from bashkit; we only marshal data). Public surface:
+**Phases 1–8 are shipped to `master`, CI green, 173 tests.** The library wraps
+bashkit faithfully (we vendor no execution logic — every semantic comes from
+bashkit; we only marshal data). Public surface:
 
 - `ExBashkit.exec/1` — stateless, fresh sandbox per call.
 - `ExBashkit.Session` — persistent, stateful sandbox:
@@ -28,17 +28,20 @@ from bashkit; we only marshal data). Public surface:
     `{:ok, bytes}`; `restore/3` (`:key`) → `{:ok, session}` | `{:error, msg}`.
     Bytes carry shell state + in-memory FS only, NOT config — resume = rebuild a
     same-capability session, then restore into it.
+  - `stat/2`, `list_dir/2`, `mkdir/3`, `remove/3`, `rename/3` — lock-free host FS
+    primitives over the (shared) session VFS.
+  - `:python` (`true` | `[name(s): …]`) — registers `python`/`python3` running
+    sandboxed Python that shares the session FS (optional `:ex_monty` dep). See
+    `ExBashkit.Python`.
 - `ExBashkit.VirtualFs` — behaviour for `:virtual_fs` backends (worked examples
   in its moduledoc).
+- `ExBashkit.Python` — the `python` builtin (optional, `ex_monty`-backed).
 
-**Next: Phase 7 — optional embedded interpreters** (`sqlite`/`typescript`/
-`python`). Each is a cargo feature + build-cost decision like `realfs`/
-`http_client` — **raise the enable/build-cost call with the user first**
-(`python` needs a git dep, breaking the clean crates.io pin). User has already
-decided ship-mode is **per-interpreter** (bake light ones into the precompiled
-NIF vs gate heavy ones behind build-from-source). Then P9 LLM tool contract.
-(P6c later: proxy `mv`/`cp` across virtual mounts; streaming.) Phase 8
-snapshot/resume is **done**.
+**Next: Phase 9 — LLM tool contract helpers** (`ExBashkit.Tool`: emit a JSON
+schema + system-prompt text, parse tool calls — the Elixir analogue of bashkit's
+`BashTool`; pure Elixir, no Rust feature cost). Phases 7 (python) and 8
+(snapshot/resume) are **done**. (P6c later: proxy `mv`/`cp` across virtual mounts;
+streaming. Possible future: a monty fork for `sys.argv`; output-byte limits.)
 
 ---
 

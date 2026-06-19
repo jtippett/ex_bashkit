@@ -168,7 +168,7 @@ Pause/resume *is* possible (phase 8), and serialization patterns from ExMonty's
 Each phase: implement the NIF(s), add the Elixir API + struct, write tests
 (`EXBASHKIT_BUILD=1 mix test`), update README + CHANGELOG, keep CI green.
 
-> **Status (Phases 1–6b + 8 shipped to `master`, CI green; 137 tests).** Everything
+> **Status (Phases 1–6b + 7 + 8 shipped to `master`, CI green; 173 tests).** Everything
 > below the line is built. The per-phase loop that's working: TDD (write the
 > failing test first) → implement → full gate (`mix test` + `mix format` +
 > `cargo fmt` + `cargo clippy -D warnings`) → dispatch the `superpowers:code-reviewer`
@@ -293,12 +293,28 @@ Hard-won specifics (don't re-derive):
 
 ### Phase 6c (later) — proxy rename/copy/symlink across virtual mounts; streaming.
 
-### Phase 7 — Optional embedded interpreters
-- `sqlite` (Turso), `typescript` (ZapCode), `python` (monty — **git-dep
-  caveat**, see §2c). Each behind a mix config flag + cargo feature. Document the
-  build-cost and the runtime gates (`BASHKIT_ALLOW_INPROCESS_SQLITE`).
-- Note: enabling `python` makes ExBashkit a *superset* of ExMonty's Python
-  surface (but without monty's fine-grained per-effect mediation).
+### Phase 7 — Sandboxed `python` builtin ✅ (re-scoped 2026-06-20)
+- **Not** bashkit-native interpreters. Findings: the pinned `bashkit 0.11.0` on
+  crates.io has **no `python` feature and no monty dep at all** (only the
+  unreleased checkout does, via a git dep) — native python would force the whole
+  bashkit dep onto a moving git source. `sqlite`/`typescript` **dropped** (user:
+  sqlite via a back-call instead; typescript unwanted).
+- Instead: `python`/`python3` as an **Elixir-defined custom builtin** (Phase 6
+  bridge) delegating to the optional **`ex_monty`** dep, gated on
+  `Code.ensure_loaded?(ExMonty)`. Shares the session VFS: an `ExMonty.Sandbox`
+  `:os` handler (`ExBashkit.Python.SessionFs`, modeled on `ExMonty.PseudoFS`)
+  routes Python's pathlib/os ops to the session via the lock-free
+  `read_file`/`write_file` + 5 new host FS primitives (`stat`/`list_dir`/`mkdir`/
+  `remove`/`rename`). No bashkit dep change, clean crates.io pin, no NIF bloat.
+- Source from `-c`/stdin/file (file read from VFS; relative resolved against the
+  shell cwd, now threaded through the back-call as `:cwd`). Effects: FS + getenv
+  only, everything else default-denied. Errors/timeout isolated to the command.
+- **argv deferred**: monty has no `sys.argv` and no module-attr injection hook
+  (modules have no `__dict__`; a `import sys; sys.argv=…` preamble is rejected) —
+  needs a **monty fork**, not an ex_monty change. `open()` deferred (pathlib I/O
+  only). ex_bashkit compiles fine without ex_monty (struct matched structurally,
+  not as `%ExMonty.Exception{}`); `python: true` without it raises a helpful error.
+- Design: `docs/plans/2026-06-20-python-builtin-design.md`.
 
 ### Phase 8 — Snapshot / resume ✅
 - `Session.snapshot/2` + `restore/3`. Marshals bashkit's high-level

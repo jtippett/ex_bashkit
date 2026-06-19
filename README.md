@@ -232,6 +232,43 @@ Reads and writes are both supported (`read`/`write`/`append`/`mkdir`/`remove`/
 FS, `:files`, and host `:mounts`, and reuses the same back-call machinery (and
 failure isolation) as custom builtins.
 
+## Python (optional)
+
+With the optional [`ex_monty`](https://github.com/jtippett/ex_monty) dependency,
+a session can run **sandboxed Python that shares the bash filesystem** — so a file
+one step writes, the next step reads, across the bash/Python boundary, just like a
+real shell.
+
+```elixir
+# add {:ex_monty, "~> ..."} to your deps, then:
+session = ExBashkit.Session.new(python: true)
+
+ExBashkit.Session.exec(session, """
+  printf '1\\n2\\n3\\n' > /nums.txt
+  python -c "from pathlib import Path; \\
+             print(sum(int(x) for x in Path('/nums.txt').read_text().split()))"
+""")
+# => {:ok, %ExBashkit.Result{stdout: "6\n", exit_code: 0}}
+```
+
+`python: true` registers `python` and `python3`. A script runs `python file.py`,
+`python -c "…"`, or a program piped on stdin; Python's `pathlib`/`os` filesystem
+operations are routed to the same virtual filesystem (`cat`, `>`, mounts, and
+`:virtual_fs` all interoperate). Python runs fully sandboxed — every effect except
+the filesystem and `os.getenv` is denied (no network, no clock) — and a Python
+error or timeout fails only that command, never the session.
+
+It's an Elixir-defined builtin over the same back-call bridge as `:builtins`, so
+there's no change to the precompiled NIF; you opt in purely by adding `ex_monty`
+to your deps. (Current limits: no `sys.argv`; `pathlib.Path` I/O, not `open()`.)
+
+**Without `ex_monty`, ExBashkit still compiles and runs normally** — `ex_monty` is
+an optional dependency gated at runtime. The only difference: `python: true` then
+raises a clear `ArgumentError` at `Session.new/1` telling you to add the dep
+(fail-fast, never a mysterious crash mid-script). A session created **without**
+`python:` is unaffected — a script that runs `python` simply gets a
+command-not-found, exactly as if the executable weren't installed.
+
 ## Snapshot & resume
 
 Capture a session's state to a binary and reload it later — after a restart, or
@@ -323,8 +360,9 @@ See [`PORTING.md`](PORTING.md) for the staged plan. In brief:
 5. ✅ Network allowlist (`:allow_net` — default-deny per-URL, SSRF protection)
 6. ✅ Elixir-defined custom builtins (`:builtins` — call back into your app)
 7. ✅ Dynamic Elixir-backed filesystem (`:virtual_fs` — same back-call bridge)
-8. ◻ Optional builtins: `sqlite` (Turso), `typescript` (ZapCode), `python` (monty)
-   — deferred pending a per-interpreter build-cost decision
+8. ✅ Sandboxed `python` builtin (optional `ex_monty`; shares the session FS).
+   `sqlite`/`typescript` dropped (use a back-call); native bashkit interpreters
+   not pursued (not on crates.io, would break the pin)
 9. ✅ Snapshot / resume (`snapshot/2` + `restore/3`, keyed or plain)
 10. ◻ LLM tool contract helpers
 

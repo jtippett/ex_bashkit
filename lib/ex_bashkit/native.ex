@@ -51,6 +51,12 @@ defmodule ExBashkit.Native do
   def session_read_file(_session, _path), do: :erlang.nif_error(:nif_not_loaded)
   def session_write_file(_session, _path, _content), do: :erlang.nif_error(:nif_not_loaded)
 
+  def session_stat(_session, _path), do: :erlang.nif_error(:nif_not_loaded)
+  def session_list_dir(_session, _path), do: :erlang.nif_error(:nif_not_loaded)
+  def session_mkdir(_session, _path, _recursive), do: :erlang.nif_error(:nif_not_loaded)
+  def session_remove(_session, _path, _recursive), do: :erlang.nif_error(:nif_not_loaded)
+  def session_rename(_session, _from, _to), do: :erlang.nif_error(:nif_not_loaded)
+
   def session_snapshot(_session, _exclude_filesystem, _exclude_functions, _key),
     do: :erlang.nif_error(:nif_not_loaded)
 
