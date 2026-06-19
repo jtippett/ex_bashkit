@@ -19,7 +19,8 @@ toolchain. The Elixir side owns the ergonomics (structs, the public API, the
 eventual LLM-tool helpers); the Rust side is a faithful, minimal bridge.
 
 ```
-lib/ex_bashkit.ex            # public API
+lib/ex_bashkit.ex            # stateless exec/1
+lib/ex_bashkit/session.ex    # ExBashkit.Session — sessions, VFS, mounts, limits
 lib/ex_bashkit/native.ex     # RustlerPrecompiled config + NIF stubs
 lib/ex_bashkit/result.ex     # %ExBashkit.Result{}
 native/ex_bashkit/src/lib.rs # #[rustler::nif] fns + shared tokio runtime
@@ -167,32 +168,59 @@ Pause/resume *is* possible (phase 8), and serialization patterns from ExMonty's
 Each phase: implement the NIF(s), add the Elixir API + struct, write tests
 (`EXBASHKIT_BUILD=1 mix test`), update README + CHANGELOG, keep CI green.
 
-### Phase 1 — Stateless `exec/1` ✅ (skeleton)
-Done. Proves rustler + tokio bridge + bashkit link + the precompiled pipeline.
-**First kickoff task: confirm it actually compiles and the smoke tests pass**
-(`EXBASHKIT_BUILD=1 mix test`), then cut `v0.1.0` to validate the release flow
-before building further.
+> **Status (Phases 1–4 shipped to `master`, CI green; 69 tests).** Everything
+> below the line is built. The per-phase loop that's working: TDD (write the
+> failing test first) → implement → full gate (`mix test` + `mix format` +
+> `cargo fmt` + `cargo clippy -D warnings`) → dispatch the `superpowers:code-reviewer`
+> subagent → fold fixes → commit straight to `master` → watch CI. The reviewer
+> has earned its keep every phase (caught the `bash.fs()` layering bug, the mount
+> silent-skip, the limits overflow-revert). **Hex publish is deferred until the
+> whole port is done** (user publishes). All public surface lives on
+> `ExBashkit` (`exec/1`) and `ExBashkit.Session`.
 
-### Phase 2 — Persistent sessions & state
-- Wrap `Bash` in `ResourceArc<Mutex<Bash>>` → `ExBashkit.Session`.
-- `new/1`, `exec/2` threading state (env, cwd, VFS) across calls.
-- `Bash::builder()` options: `username`, `hostname`, `env`, `cwd`.
-- Decode an options keyword list/map on the Elixir side into builder calls.
+### Phase 1 — Stateless `exec/1` ✅
+Done. `v0.1.0` tagged: GitHub release + 4 precompiled NIFs + checksum file all
+verified end-to-end (only `mix hex.publish` itself is unexercised, by choice).
 
-### Phase 3 — Virtual filesystem
-- Expose `InMemoryFs` (default), seedable with files from Elixir.
-- Host mounts via `RealFs`/`MountableFs` with explicit modes — mirror ExMonty's
-  `ExBashkit.Mount` design (`:read_only` / `:read_write` / `:overlay`, path
-  canonicalization, escape checks). bashkit provides `OverlayFs`/`MountableFs`.
+### Phase 2 — Persistent sessions & state ✅
+Done. `ExBashkit.Session` = `ResourceArc<Mutex<Bash>>` (opaque `%Session{ref}}`),
+`new/1` + `exec/2` thread state across calls. Builder options decoded Elixir-side:
+`:env` (map/keyword), `:cwd`, `:username`, `:hostname`. The `exec` lock recovers
+from poisoning (`into_inner`) so a bashkit panic can't brick a session.
 
-### Phase 4 — Resource limits
-- Map `ExecutionLimits` (`max_commands`, `max_loop_iterations`,
-  `max_function_depth`, `max_output_bytes`) to an Elixir keyword list, decoded
-  into the builder. (Same shape as ExMonty's `decode_resource_limits`.)
+### Phase 3 — Virtual filesystem ✅
+Done. `Session.new(files: %{...})` seeds the in-memory FS; `write_file/3` +
+`read_file/2` give the host access to the FS scripts use.
+- **Store the interpreter's real FS handle** (`bash.fs()` *after* `build()`) —
+  it's a `MountableFs` layered over the in-memory base, NOT a raw `InMemoryFs`.
+- Host mounts: `Session.new(mounts: [{vfs, host, mode}], allowed_mount_paths: …)`.
+  **Only `:read_only` / `:read_write`** — bashkit has no real-FS overlay mode, so
+  `:overlay` was dropped ("only support what bashkit does"). **No `ExBashkit.Mount`
+  resource / lease machinery** — bashkit is push-based, so mounts are plain builder
+  config at session creation. This is the big simplification vs ExMonty's pull-based
+  lease/checkout/drive design; don't reintroduce it. bashkit owns all
+  escape/canonicalization/sensitive-path checks; we surface *refused* mounts (which
+  bashkit silently skips) via a post-build `fs.exists(vfs)` probe → `{:error, _}`.
 
-### Phase 5 — Network allowlist
+### Phase 4 — Resource limits ✅
+Done. `Session.new(limits: [...])` decodes a map onto `ExecutionLimits` via
+`builder.limits()`. Keys: `:max_commands`, `:max_loop_iterations`,
+`:max_total_loop_iterations`, `:max_function_depth`, `:max_input_bytes`,
+`:timeout_ms`. All produce `{:error, _}` on breach (per-script; counters reset
+each `exec`). A value past `usize::MAX` means "unlimited" (saturates).
+- **Deferred:** output-byte caps (`max_stdout_bytes`/`max_stderr_bytes`) — they
+  *truncate* rather than error, so exposing them well means adding
+  `stdout_truncated`/`stderr_truncated` to `%ExBashkit.Result{}` (which changes the
+  result tuple and breaks the full-struct doctests). A small, self-contained
+  follow-up when wanted.
+
+### Phase 5 — Network allowlist (next)
 - `NetworkAllowlist` behind the `http_client` feature. Default deny. Switch the
   relevant NIF to `DirtyIo` since real sockets can block.
+- **Decision to raise with the user first:** unlike `realfs` (a no-dep feature we
+  enabled by default), `http_client` likely pulls real HTTP/TLS dependencies →
+  meaningfully bigger build. Confirm enabling-by-default vs opt-in, same as the
+  realfs call.
 
 ### Phase 6 — Elixir-defined virtual executables & a dynamic VFS (high value)
 bashkit's runtime extension points are first-class — dynamic feeding is *not*

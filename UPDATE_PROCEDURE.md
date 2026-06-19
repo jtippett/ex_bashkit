@@ -46,15 +46,23 @@ types/functions **we actually use** (see the table in Phase 2).
 Sort what you find. Our binding currently touches a small surface; it grows as
 phases land (see `PORTING.md`).
 
-| We use | Where in our code |
-|--------|-------------------|
-| `Bash::new()`, `Bash::builder()`, `.exec()` | `native/ex_bashkit/src/lib.rs` |
-| `ExecResult { stdout, stderr, exit_code, ... }` | `lib.rs` encode → `ExBashkit.Result` |
-| `Bash::builder()` options (env, cwd, fs, limits, network) | added per phase |
-| `ExecutionLimits`, fs types (`InMemoryFs`, `MountableFs`, `OverlayFs`) | added per phase |
-| `Snapshot`, `SnapshotOptions` | added in phase 8 |
-| `Builtin` trait, `register_builtin` | added in phase 6 |
-| Feature flags (`bash_tool`, `sqlite`, `python`, …) | `Cargo.toml` `[dependencies]` |
+| We use | Where in our code | Since |
+|--------|-------------------|-------|
+| `Bash::new()`, `Bash::builder()`, `.build()`, `.exec()` | `lib.rs` | P1/P2 |
+| `ExecResult { stdout, stderr, exit_code }` | `lib.rs` `encode_exec_result` → `ExBashkit.Result` | P1 |
+| Builder `.env/.cwd/.username/.hostname` | `lib.rs` `session_new` | P2 |
+| `Bash::fs()` getter; `FileSystem` trait (`read_file`/`write_file`/`mkdir`/`exists`) | `lib.rs` `session_read_file`/`session_write_file` | P3 |
+| `.fs(...)` builder, `MountableFs` (the layer `bash.fs()` returns) | implicit via `build()` | P3 |
+| `RealFs::new`, `RealFsMode`, builder `.mount_real_{readonly,readwrite}_at`, `.allowed_mount_paths` | `lib.rs` `session_new` mount loop | P3 |
+| `ExecutionLimits` + setters, builder `.limits()` | `lib.rs` `decode_limits` | P4 |
+| `NetworkAllowlist`, `http_client` feature | (planned) | P5 |
+| `Builtin` trait, `.builtin(...)` | (planned) | P6 |
+| `Snapshot`, `SnapshotOptions` | (planned) | P8 |
+| Feature flags: `realfs` (enabled), `http_client`/`sqlite`/`python`/… (off) | `Cargo.toml` | — |
+
+When a bump breaks the build, the failure almost always points at one of these
+rows. `RealFsMode` (RO/RW only — no overlay) and the sensitive-path denylist
+(includes `/private`) are the most likely to shift.
 
 **Breaking** = a signature/type/field we use changed → must fix before bumping.
 **Non-breaking** = new builtins, perf, internal fixes → just pick up.
@@ -72,11 +80,16 @@ and whether any **feature** we enable was renamed or split.
 In `native/ex_bashkit/Cargo.toml`:
 
 ```toml
-# bashkit = { version = "=0.11.0", default-features = false }
-bashkit = { path = "../../../bashkit/crates/bashkit", default-features = false }
+# bashkit = { version = "=0.11.0", default-features = false, features = ["realfs"] }
+bashkit = { path = "../../../bashkit/crates/bashkit", default-features = false, features = ["realfs"] }
 ```
 
 (Assumes a bashkit checkout at `../bashkit` relative to the project root.)
+
+> **Keep the feature set in sync.** We build `default-features = false` plus
+> `features = ["realfs"]` (host directory mounts; a no-dep feature gate). When a
+> network phase lands it will add `http_client`. Carry whatever features are
+> enabled through both the path-dep swap and the re-pin below.
 
 ### 3.2 Build and fix
 
@@ -112,7 +125,7 @@ CHANGELOG `[Unreleased]` entry from the **user's** perspective.
 ### 4.1 Re-pin to the exact released version
 
 ```toml
-bashkit = { version = "=0.<new>.0", default-features = false }
+bashkit = { version = "=0.<new>.0", default-features = false, features = ["realfs"] }
 # path dep commented out
 ```
 
