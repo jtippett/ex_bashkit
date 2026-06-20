@@ -372,6 +372,40 @@ ExBashkit pins an exact bashkit version and vendors no logic — all execution
 semantics come from upstream. Version bumps follow
 [`UPDATE_PROCEDURE.md`](UPDATE_PROCEDURE.md).
 
+## Releasing
+
+Releases are automated. Pushing a `vX.Y.Z` tag builds the precompiled NIFs,
+creates a GitHub release, and publishes to Hex — **pausing for a manual approval
+before anything ships**. You never hand-build checksums or re-tag.
+
+**One-time setup.** Hex no longer mints API keys from the CLI (auth is OAuth);
+generate one at [hex.pm/dashboard/keys](https://hex.pm/dashboard/keys) with the
+`api` permission, then store it scoped to the `hex` environment:
+
+```bash
+gh secret set HEX_API_KEY --env hex --repo jtippett/ex_bashkit
+```
+
+**To cut a release:**
+
+1. Bump `@version` in `mix.exs`; move the `CHANGELOG.md` `[Unreleased]` section
+   under the new version number.
+2. Open a PR and merge to `master` once CI is green.
+3. Tag the merge commit and push the tag:
+   ```bash
+   git tag -a vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z
+   ```
+4. `release.yml` builds NIFs for all four targets, creates the GitHub release
+   with the `.tar.gz` artifacts, then **waits for approval**.
+5. Review the release, then approve the **`hex`** deployment in the workflow run
+   (Actions → the run → *Review deployments* → approve). On approval it
+   regenerates `checksum-Elixir.ExBashkit.Native.exs` from the released artifacts
+   and runs `mix hex.publish`.
+
+Don't commit the checksum file or move a published tag by hand — the pipeline
+owns both. See [`UPDATE_PROCEDURE.md`](UPDATE_PROCEDURE.md) for bumping the
+pinned bashkit version.
+
 ## License
 
 MIT © James Tippett. bashkit is MIT-licensed by its authors.
