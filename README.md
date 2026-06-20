@@ -433,25 +433,28 @@ generate one at [hex.pm/dashboard/keys](https://hex.pm/dashboard/keys) with the
 gh secret set HEX_API_KEY --env hex --repo jtippett/ex_bashkit
 ```
 
-**To cut a release:**
+**To cut a release**, run the release assistant from `master` and follow the
+prompts:
 
-1. Bump `@version` in `mix.exs`; move the `CHANGELOG.md` `[Unreleased]` section
-   under the new version number.
-2. Open a PR and merge to `master` once CI is green.
-3. Tag the merge commit and push the tag:
-   ```bash
-   git tag -a vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z
-   ```
-4. `release.yml` builds NIFs for all four targets, creates the GitHub release
-   with the `.tar.gz` artifacts, then **waits for approval**.
-5. Review the release, then approve the **`hex`** deployment in the workflow run
-   (Actions → the run → *Review deployments* → approve). On approval it
-   regenerates `checksum-Elixir.ExBashkit.Native.exs` from the released artifacts
-   and runs `mix hex.publish`.
+```bash
+just release          # or, without just:  elixir scripts/release.exs
+```
 
-Don't commit the checksum file or move a published tag by hand — the pipeline
-owns both. See [`UPDATE_PROCEDURE.md`](UPDATE_PROCEDURE.md) for bumping the
-pinned bashkit version.
+It shows the current and published versions, asks for a **patch / minor / major**
+bump (you pick the level — no version numbers to type), rolls the
+`CHANGELOG.md` `[Unreleased]` section into the new version, then commits, tags,
+and pushes. That kicks off `release.yml`, which builds NIFs for all four targets
+and creates the GitHub release.
+
+Then **approve the publish**: open the workflow run → *Review deployments* →
+approve the **`hex`** environment. On approval it generates
+`checksum-Elixir.ExBashkit.Native.exs` from the released artifacts and runs
+`mix hex.publish`.
+
+Keep notes under `## [Unreleased]` in `CHANGELOG.md` as you work — the assistant
+rolls them into each release. Don't commit the checksum file or move a published
+tag by hand; the pipeline owns both. See
+[`UPDATE_PROCEDURE.md`](UPDATE_PROCEDURE.md) for bumping the pinned bashkit version.
 
 ## License
 
