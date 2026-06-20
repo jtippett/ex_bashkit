@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## 0.1.1 - 2026-06-20
+
 ### Added
 
 - LLM tool recipe. A session can be used as an agent "bash" tool with a small
