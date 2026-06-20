@@ -126,7 +126,7 @@ defmodule ExBashkit.SessionBuiltinsTest do
       assert {:ok, %Result{stdout: "fine\n"}} = Session.exec(session, "ok")
     end
 
-    test "a timed-out builtin's worker is cancelled when the next command starts" do
+    test "a timed-out builtin's work is cancelled, not left to finish during later commands" do
       {:ok, counter} = Agent.start_link(fn -> 0 end)
 
       session =
@@ -134,20 +134,19 @@ defmodule ExBashkit.SessionBuiltinsTest do
           builtin_timeout_ms: 100,
           builtins: %{
             # Times out at 100ms; only bumps the counter at 500ms — i.e. only if
-            # its worker is allowed to keep running past the timeout.
+            # its work is allowed to keep running past the timeout.
             "slow" => fn _ ->
               Process.sleep(500)
               Agent.update(counter, &(&1 + 1))
               {:ok, ""}
-            end,
-            "quick" => fn _ -> {:ok, "q\n"} end
+            end
           }
         )
 
-      # `slow` times out (exit 124) then `quick` runs; starting `quick` must kill
-      # slow's orphaned worker before its 500ms bump.
-      assert {:ok, %Result{}} = Session.exec(session, "slow; quick")
-      Process.sleep(600)
+      # `slow` times out at 100ms; the following *native* `sleep` keeps the exec
+      # alive well past slow's 500ms side effect. With the worker bounded to the
+      # timeout, that side effect must never land.
+      assert {:ok, %Result{}} = Session.exec(session, "slow; sleep 1")
       assert Agent.get(counter, & &1) == 0
     end
 

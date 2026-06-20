@@ -376,7 +376,7 @@ defmodule ExBashkit.Session do
         script
       )
       when is_binary(script) do
-    {handler, cleanup} = start_handler(builtins, virtual_fs)
+    {handler, cleanup} = start_handler(builtins, virtual_fs, timeout)
 
     try do
       case ExBashkit.Native.session_exec(ref, script, handler, timeout) do
@@ -716,7 +716,7 @@ defmodule ExBashkit.Session do
 
   # With neither builtins nor virtual filesystems there can be no back-call, so
   # no handler process is needed; the pid we hand the NIF is never used.
-  defp start_handler(builtins, virtual_fs)
+  defp start_handler(builtins, virtual_fs, _timeout)
        when map_size(builtins) == 0 and map_size(virtual_fs) == 0 do
     {self(), fn -> :ok end}
   end
@@ -724,8 +724,8 @@ defmodule ExBashkit.Session do
   # Otherwise spawn a short-lived process to service back-calls for the duration
   # of one `exec/2`. It is linked so it dies with the caller (no orphan), and we
   # unlink-then-kill on teardown so our own kill never propagates to the caller.
-  defp start_handler(builtins, virtual_fs) do
-    pid = spawn_link(fn -> handler_loop(builtins, virtual_fs, nil) end)
+  defp start_handler(builtins, virtual_fs, timeout) do
+    pid = spawn_link(fn -> handler_loop(builtins, virtual_fs, timeout) end)
 
     cleanup = fn ->
       Process.unlink(pid)
@@ -735,8 +735,7 @@ defmodule ExBashkit.Session do
     {pid, cleanup}
   end
 
-  # `worker` is the process running the *current* builtin, if any (see below).
-  defp handler_loop(builtins, virtual_fs, worker) do
+  defp handler_loop(builtins, virtual_fs, timeout) do
     receive do
       {:bashkit_call, req_id, name, args, stdin, env_pairs, cwd} ->
         # Service the builtin in a child process so THIS loop stays free to
@@ -745,49 +744,52 @@ defmodule ExBashkit.Session do
         # handler, which would otherwise deadlock (the loop can't recv the
         # `{:bashkit_fs, ...}` while it's blocked running the builtin).
         #
-        # A fresh `{:bashkit_call}` means bashkit treated the previous builtin as
-        # done — it replied, or its back-call hit `:builtin_timeout_ms`. Kill a
-        # still-running previous worker (a timed-out builtin whose Elixir work
-        # outlived the timeout) so it can't run concurrently with this one. We
-        # unlink first so the untrappable `:kill` doesn't travel back up our own
-        # link, which keeps "one builtin worker at a time" true even on the
-        # timeout path. (`invoke_builtin` try/rescue/catches everything and always
-        # replies, so a worker that finishes normally has already exited.)
-        if worker && Process.alive?(worker) do
-          Process.unlink(worker)
-          Process.exit(worker, :kill)
-        end
+        # The worker bounds its *own* run to `:builtin_timeout_ms` (see
+        # `invoke_builtin/7`), brutal-killing the builtin's work at the timeout —
+        # so a timed-out builtin can't keep running (and landing side effects)
+        # during later commands. The worker is linked, so it also dies with the
+        # handler on teardown; it never carries a crash back (the inner task is
+        # isolated and the body always replies).
+        spawn_link(fn ->
+          {stdout, stderr, exit_code} =
+            invoke_builtin(builtins, name, args, stdin, env_pairs, cwd, timeout)
 
-        next =
-          spawn_link(fn ->
-            {stdout, stderr, exit_code} =
-              invoke_builtin(builtins, name, args, stdin, env_pairs, cwd)
+          ExBashkit.Native.builtin_reply(req_id, stdout, stderr, exit_code)
+        end)
 
-            ExBashkit.Native.builtin_reply(req_id, stdout, stderr, exit_code)
-          end)
-
-        handler_loop(builtins, virtual_fs, next)
+        handler_loop(builtins, virtual_fs, timeout)
 
       {:bashkit_fs, req_id, mount, op, path, data, recursive} ->
         reply = invoke_fs(Map.fetch!(virtual_fs, mount), op, path, data, recursive)
         ExBashkit.Native.fs_reply(req_id, reply)
-        handler_loop(builtins, virtual_fs, worker)
+        handler_loop(builtins, virtual_fs, timeout)
     end
   end
 
-  # Run one builtin and normalize its result to {stdout, stderr, exit_code}. A
-  # raise, throw, or malformed return becomes a failed command (exit 1) with a
-  # descriptive stderr — never a crashed handler or a wedged session.
-  defp invoke_builtin(builtins, name, args, stdin, env_pairs, cwd) do
+  # Run one builtin, bounded to `timeout`, and normalize its result to
+  # {stdout, stderr, exit_code}. The work runs in an inner Task so a builtin that
+  # exceeds `:builtin_timeout_ms` is *brutally killed at the timeout* (exit 124),
+  # rather than running on — and landing side effects — during later commands.
+  # The handler stays free meanwhile: only this worker process blocks on the Task,
+  # so a builtin's nested FS back-calls are still serviced.
+  defp invoke_builtin(builtins, name, args, stdin, env_pairs, cwd, timeout) do
     call = %{args: args, stdin: stdin, env: Map.new(env_pairs), cwd: cwd}
+    task = Task.async(fn -> run_builtin(builtins, name, call) end)
 
-    try do
-      builtins |> Map.fetch!(name) |> apply([call]) |> normalize_builtin_return(name)
-    rescue
-      e -> {"", "#{name}: builtin raised: #{Exception.message(e)}\n", 1}
-    catch
-      kind, reason -> {"", "#{name}: builtin #{kind}: #{inspect(reason)}\n", 1}
+    case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
+      {:ok, result} -> result
+      _ -> {"", "#{name}: builtin timed out after #{timeout}ms\n", 124}
     end
+  end
+
+  # The builtin function itself. A raise, throw, or malformed return becomes a
+  # failed command (exit 1) with a descriptive stderr — never a crash.
+  defp run_builtin(builtins, name, call) do
+    builtins |> Map.fetch!(name) |> apply([call]) |> normalize_builtin_return(name)
+  rescue
+    e -> {"", "#{name}: builtin raised: #{Exception.message(e)}\n", 1}
+  catch
+    kind, reason -> {"", "#{name}: builtin #{kind}: #{inspect(reason)}\n", 1}
   end
 
   defp normalize_builtin_return({:ok, io}, _name), do: {IO.iodata_to_binary(io), "", 0}
