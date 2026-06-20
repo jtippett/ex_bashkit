@@ -33,7 +33,7 @@ jobs:
             os: ubuntu-24.04-arm
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Extract version
         id: version
@@ -107,7 +107,7 @@ jobs:
       EXBASHKIT_BUILD: "1"
       HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Set up Elixir
         uses: erlef/setup-beam@v1
