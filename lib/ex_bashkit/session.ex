@@ -735,8 +735,22 @@ defmodule ExBashkit.Session do
   defp handler_loop(builtins, virtual_fs) do
     receive do
       {:bashkit_call, req_id, name, args, stdin, env_pairs, cwd} ->
-        {stdout, stderr, exit_code} = invoke_builtin(builtins, name, args, stdin, env_pairs, cwd)
-        ExBashkit.Native.builtin_reply(req_id, stdout, stderr, exit_code)
+        # Service the builtin in a child process so THIS loop stays free to
+        # receive the nested FS back-calls a builtin may trigger — e.g. the
+        # `python` builtin reading a `:virtual_fs` mount routes through this same
+        # handler, which would otherwise deadlock (the loop can't recv the
+        # `{:bashkit_fs, ...}` while it's blocked running the builtin). bashkit
+        # runs commands one at a time, so at most one builtin is in flight per
+        # exec. `invoke_builtin` try/rescue/catches everything and always replies,
+        # so the linked child exits normally (the link never carries a crash) and
+        # is torn down with the handler.
+        spawn_link(fn ->
+          {stdout, stderr, exit_code} =
+            invoke_builtin(builtins, name, args, stdin, env_pairs, cwd)
+
+          ExBashkit.Native.builtin_reply(req_id, stdout, stderr, exit_code)
+        end)
+
         handler_loop(builtins, virtual_fs)
 
       {:bashkit_fs, req_id, mount, op, path, data, recursive} ->

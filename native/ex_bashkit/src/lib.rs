@@ -141,6 +141,17 @@ struct CallTarget {
     timeout: Duration,
 }
 
+/// Clears a session's `fs_target` cell on scope exit (normal return *or* a panic
+/// unwinding out of `session_exec`), so a panicked exec never leaves a stale
+/// handler pid behind for the next virtual-FS back-call. Mirrors `PendingCleanup`.
+struct FsTargetGuard(Arc<Mutex<Option<CallTarget>>>);
+
+impl Drop for FsTargetGuard {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+}
+
 /// Build an `ExecResult` from raw stdout/stderr bytes and an exit code. Sets
 /// `stdout_bytes` so binary output round-trips exactly, and a lossy `stdout`
 /// string for the text path (pipes, captures).
@@ -649,6 +660,12 @@ fn encode_exec_result<'a>(env: Env<'a>, result: bashkit::Result<bashkit::ExecRes
     match result {
         Ok(r) => {
             let ok = rustler::types::atom::ok().encode(env);
+            // `r.stdout` is a (lossy) String. bashkit only carries exact
+            // `stdout_bytes` on a *builtin's own* ExecResult, not on the script's
+            // top-level result — its interpreter re-buffers output through a
+            // String — so reading `stdout_bytes` here is always `None` and binary
+            // builtin output is unavoidably lossy at the result boundary. That's a
+            // bashkit limitation, not ours; we don't paper over it.
             let payload = rustler::types::tuple::make_tuple(
                 env,
                 &[
@@ -973,14 +990,16 @@ fn session_exec<'a>(
     let extensions = ExecutionExtensions::new().with(target);
 
     // Publish the target so any mounted `ElixirFs` can reach this exec's handler
-    // (FS methods have no execution context). Cleared after the run so no stale
-    // pid lingers. Safe to mutate without the `bash` lock's help because we hold
-    // it — this session's execs are serialized.
+    // (FS methods have no execution context). Safe to mutate without the `bash`
+    // lock's help because we hold it — this session's execs are serialized. The
+    // RAII guard clears it on every exit path, *including* a bashkit panic
+    // unwinding through `block_on` (rustler catches the panic, but an explicit
+    // clear would be skipped, leaving a stale handler pid that later virtual-FS
+    // host calls would wait on).
     *session.fs_target.lock().unwrap_or_else(|p| p.into_inner()) = Some(target);
+    let _fs_target_guard = FsTargetGuard(Arc::clone(&session.fs_target));
 
     let result = runtime().block_on(async { bash.exec_with_extensions(&script, extensions).await });
-
-    *session.fs_target.lock().unwrap_or_else(|p| p.into_inner()) = None;
 
     encode_exec_result(env, result)
 }
@@ -988,7 +1007,7 @@ fn session_exec<'a>(
 /// Read a file from the session's virtual filesystem on the host's behalf,
 /// returning `{:ok, binary}` or `{:error, message}`. Operates on the shared FS
 /// `Arc` directly (no `bash` lock), so it works even mid-script.
-#[rustler::nif(schedule = "DirtyCpu")]
+#[rustler::nif(schedule = "DirtyIo")]
 fn session_read_file<'a>(
     env: Env<'a>,
     session: ResourceArc<SessionResource>,
@@ -1024,7 +1043,7 @@ fn session_read_file<'a>(
 /// Write a file into the session's virtual filesystem on the host's behalf
 /// (creating parent directories), returning `:ok` or `{:error, message}`. Also
 /// the seeding primitive behind `Session.new(files: ...)`.
-#[rustler::nif(schedule = "DirtyCpu")]
+#[rustler::nif(schedule = "DirtyIo")]
 fn session_write_file<'a>(
     env: Env<'a>,
     session: ResourceArc<SessionResource>,
@@ -1080,7 +1099,7 @@ fn encode_fs_unit(env: Env<'_>, result: bashkit::Result<()>) -> Term<'_> {
 /// `stat` a path in the session's filesystem, returning `{:ok, type, size}`
 /// (`type` is `:file`/`:dir`/`:symlink`) or `{:error, message}`. Lock-free on the
 /// shared FS `Arc`, like `session_read_file`.
-#[rustler::nif(schedule = "DirtyCpu")]
+#[rustler::nif(schedule = "DirtyIo")]
 fn session_stat<'a>(env: Env<'a>, session: ResourceArc<SessionResource>, path: String) -> Term<'a> {
     let fs = Arc::clone(&session.fs.0);
     let result = runtime().block_on(async move { fs.stat(Path::new(&path)).await });
@@ -1102,7 +1121,7 @@ fn session_stat<'a>(env: Env<'a>, session: ResourceArc<SessionResource>, path: S
 
 /// List a directory in the session's filesystem, returning
 /// `{:ok, [{name, type}]}` or `{:error, message}`.
-#[rustler::nif(schedule = "DirtyCpu")]
+#[rustler::nif(schedule = "DirtyIo")]
 fn session_list_dir<'a>(
     env: Env<'a>,
     session: ResourceArc<SessionResource>,
@@ -1134,7 +1153,7 @@ fn session_list_dir<'a>(
 
 /// Create a directory in the session's filesystem (`recursive` ≈ `mkdir -p`),
 /// returning `:ok` or `{:error, message}`.
-#[rustler::nif(schedule = "DirtyCpu")]
+#[rustler::nif(schedule = "DirtyIo")]
 fn session_mkdir<'a>(
     env: Env<'a>,
     session: ResourceArc<SessionResource>,
@@ -1148,7 +1167,7 @@ fn session_mkdir<'a>(
 
 /// Remove a file or directory from the session's filesystem (`recursive` to
 /// remove a non-empty directory), returning `:ok` or `{:error, message}`.
-#[rustler::nif(schedule = "DirtyCpu")]
+#[rustler::nif(schedule = "DirtyIo")]
 fn session_remove<'a>(
     env: Env<'a>,
     session: ResourceArc<SessionResource>,
@@ -1162,7 +1181,7 @@ fn session_remove<'a>(
 
 /// Rename/move a path within the session's filesystem, returning `:ok` or
 /// `{:error, message}`.
-#[rustler::nif(schedule = "DirtyCpu")]
+#[rustler::nif(schedule = "DirtyIo")]
 fn session_rename<'a>(
     env: Env<'a>,
     session: ResourceArc<SessionResource>,

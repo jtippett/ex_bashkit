@@ -150,6 +150,51 @@ if Code.ensure_loaded?(ExMonty) do
 
         assert out =~ "sek def"
       end
+
+      test "python can read an Elixir-backed :virtual_fs mount (nested back-call)" do
+        # The python builtin and the virtual_fs backend both ride the same handler
+        # process; reading the mount from inside python is a nested back-call. The
+        # handler must stay free to service it (else it deadlocks/times out).
+        s =
+          Session.new(
+            python: true,
+            virtual_fs: %{"/api" => fn %{op: :read, path: "/" <> k} -> {:ok, "v:#{k}\n"} end}
+          )
+
+        code = "from pathlib import Path; print(Path('/api/widget').read_text().strip())"
+
+        assert {:ok, %Result{stdout: "v:widget\n", exit_code: 0}} =
+                 Session.exec(s, "python3 -c \"#{code}\"")
+      end
+
+      test "python can write through a :virtual_fs mount" do
+        {:ok, store} = Agent.start_link(fn -> %{} end)
+
+        backend = fn
+          %{op: :write, path: "/" <> k, data: d} ->
+            Agent.update(store, &Map.put(&1, k, d))
+            :ok
+
+          %{op: :read, path: "/" <> k} ->
+            case Agent.get(store, &Map.get(&1, k)) do
+              nil -> {:error, :enoent}
+              v -> {:ok, v}
+            end
+
+          # write_file/3 creates the parent (mkdir -p) before writing, which for a
+          # write at the mount root is a mkdir on "/". A writable backend handles it.
+          %{op: :mkdir} ->
+            :ok
+
+          _ ->
+            {:error, :enotsup}
+        end
+
+        s = Session.new(python: true, virtual_fs: %{"/kv" => backend})
+        code = "from pathlib import Path; Path('/kv/x').write_text('from-python')"
+        assert {:ok, %Result{exit_code: 0}} = Session.exec(s, "python3 -c \"#{code}\"")
+        assert Agent.get(store, &Map.get(&1, "x")) == "from-python"
+      end
     end
 
     describe "errors and isolation" do

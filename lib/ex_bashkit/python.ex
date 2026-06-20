@@ -99,8 +99,14 @@ defmodule ExBashkit.Python do
   defp execute(session, env, timeout, code, script_name) do
     os = SessionFs.os_handler(session, env)
     limits = %{max_duration_secs: max(timeout / 1000, 0.001)}
+    opts = [os: os, limits: limits, script_name: script_name]
 
-    case ExMonty.Sandbox.run(code, os: os, limits: limits, script_name: script_name) do
+    # `apply/3`, not a direct `ExMonty.Sandbox.run/2`, so this module compiles
+    # warning-free when the optional :ex_monty dep is absent — a direct reference
+    # emits an "undefined module" warning at compile, noise for the (common) users
+    # who never enable python. We only reach here when ex_monty IS loaded (the
+    # Code.ensure_loaded?/1 gate in normalize/1 runs at Session.new time).
+    case apply(ExMonty.Sandbox, :run, [code, opts]) do
       {:ok, _value, output} -> {:ok, output}
       {:error, reason} -> {:error, format_error(reason)}
     end
