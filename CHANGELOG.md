@@ -1,5 +1,7 @@
 # Changelog
 
+## [Unreleased]
+
 ## 0.1.2 - 2026-06-20
 
 First release. An Elixir NIF wrapper around

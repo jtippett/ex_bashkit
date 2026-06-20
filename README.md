@@ -4,17 +4,18 @@ Elixir NIF wrapper for [**bashkit**](https://github.com/everruns/bashkit) — a
 sandboxed, virtual bash interpreter written in Rust.
 
 Run bash scripts safely from Elixir: ~150 builtins (`echo`, `grep`, `sed`,
-`awk`, `jq`, `cat`, `find`, `sort`, …) are **reimplemented in Rust**, file I/O
+`awk`, `cat`, `find`, `sort`, …) are **reimplemented in Rust**, file I/O
 hits an **in-memory virtual filesystem**, and there is **no `fork`/`exec`**
 escape hatch. Nothing touches the host OS unless you explicitly grant it. That
 makes it safe to run *untrusted* scripts — for example, bash written by an LLM
 agent.
 
-> ⚠️ **Early days.** Stateless `ExBashkit.exec/1` and persistent
-> `ExBashkit.Session`s are wired up today. The rest of the surface
-> (virtual-filesystem mounts, resource limits, a network allowlist,
-> Elixir-defined custom builtins, snapshot/resume) is in progress — see
-> [`PORTING.md`](PORTING.md) for the plan and current status.
+> **Status.** The full capability set is implemented and tested: stateless
+> `ExBashkit.exec/1`, persistent `ExBashkit.Session`s, an in-memory virtual
+> filesystem with host mounts, resource limits, a network allowlist,
+> Elixir-defined custom builtins, Elixir-backed virtual filesystems,
+> snapshot/resume, and an optional sandboxed `python` builtin. It's a young
+> `0.1.x` release, so expect the API to still evolve.
 
 ## Installation
 
@@ -146,7 +147,7 @@ untrusted scripts. Exceeding a limit returns `{:error, message}`.
 ```elixir
 session = ExBashkit.Session.new(limits: [max_commands: 1_000, timeout_ms: 2_000])
 
-ExBashkit.Session.exec(session, "for i in {1..1000000}; do :; done")
+ExBashkit.Session.exec(session, "for i in $(seq 1 5000); do echo $i; done")
 # => {:error, "resource limit exceeded: maximum command count exceeded (1000)"}
 ```
 
@@ -199,10 +200,10 @@ ExBashkit.Session.exec(session, "echo \"the answer is $(kv_get answer)\"")
 # => {:ok, %ExBashkit.Result{stdout: "the answer is 42\n", exit_code: 0}}
 ```
 
-A builtin receives `%{args:, stdin:, env:}` and returns `{:ok, iodata}` (stdout,
-exit 0), `{:error, iodata}` (stderr, exit 1), or a full `%ExBashkit.Result{}`. A
-handler that raises or exceeds `:builtin_timeout_ms` fails only that command, not
-the session.
+A builtin receives `%{args:, stdin:, env:, cwd:}` (`cwd` is the shell's working
+directory) and returns `{:ok, iodata}` (stdout, exit 0), `{:error, iodata}`
+(stderr, exit 1), or a full `%ExBashkit.Result{}`. A handler that raises or
+exceeds `:builtin_timeout_ms` fails only that command, not the session.
 
 ## Virtual filesystem backends
 
