@@ -30,25 +30,14 @@ defmodule ExBashkit.MixProject do
     [
       {:rustler, "~> 0.38", optional: true},
       {:rustler_precompiled, "~> 0.9"},
-      ex_monty_dep(),
+      # `:ex_monty` enables the `python` builtin (`Session.new(python: true)`). It's
+      # an *optional* dependency: consumers opt in by adding `:ex_monty` to their
+      # own deps, and ExBashkit gates on it at runtime via `Code.ensure_loaded?/1`
+      # and compiles cleanly without it. (It ships a precompiled NIF, so enabling
+      # python needs no Rust build.)
+      {:ex_monty, "~> 0.4", optional: true},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false}
     ]
-  end
-
-  # `:ex_monty` enables the `python` builtin (`Session.new(python: true)`). It is a
-  # runtime-optional dependency: consumers opt in by adding `:ex_monty` to their
-  # own deps and ExBashkit gates on it at runtime via `Code.ensure_loaded?/1`.
-  #
-  # We use the sibling checkout when present (co-development); otherwise we fetch
-  # the published release, which ships a precompiled NIF (no Rust build needed).
-  # Both forms make ex_monty present at compile time, so the python code compiles
-  # cleanly with no special-casing.
-  defp ex_monty_dep do
-    if File.dir?(Path.expand("../ex_monty", __DIR__)) do
-      {:ex_monty, path: "../ex_monty", optional: true}
-    else
-      {:ex_monty, github: "jtippett/ex_monty", tag: "v0.4.0", optional: true}
-    end
   end
 
   defp package do
