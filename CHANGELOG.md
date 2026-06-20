@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## 0.1.3 - 2026-06-20
+
 ### Added
 
 - The `jq` builtin (JSON processing) is now bundled — bashkit's `jq` feature
