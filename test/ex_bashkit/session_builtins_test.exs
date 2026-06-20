@@ -126,6 +126,31 @@ defmodule ExBashkit.SessionBuiltinsTest do
       assert {:ok, %Result{stdout: "fine\n"}} = Session.exec(session, "ok")
     end
 
+    test "a timed-out builtin's worker is cancelled when the next command starts" do
+      {:ok, counter} = Agent.start_link(fn -> 0 end)
+
+      session =
+        Session.new(
+          builtin_timeout_ms: 100,
+          builtins: %{
+            # Times out at 100ms; only bumps the counter at 500ms — i.e. only if
+            # its worker is allowed to keep running past the timeout.
+            "slow" => fn _ ->
+              Process.sleep(500)
+              Agent.update(counter, &(&1 + 1))
+              {:ok, ""}
+            end,
+            "quick" => fn _ -> {:ok, "q\n"} end
+          }
+        )
+
+      # `slow` times out (exit 124) then `quick` runs; starting `quick` must kill
+      # slow's orphaned worker before its 500ms bump.
+      assert {:ok, %Result{}} = Session.exec(session, "slow; quick")
+      Process.sleep(600)
+      assert Agent.get(counter, & &1) == 0
+    end
+
     test "a builtin cancelled by the script timeout doesn't wedge the session" do
       # bashkit's own execution timeout (:limits timeout_ms) fires *while* the
       # builtin is parked awaiting Elixir, dropping the whole exec future. The

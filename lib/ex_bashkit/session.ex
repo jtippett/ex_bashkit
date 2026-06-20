@@ -407,7 +407,9 @@ defmodule ExBashkit.Session do
 
   This targets the in-memory and host-mount filesystem; it is not the way to feed
   a `:virtual_fs` mount (those are driven by your backend, only while a script
-  runs). A path under a `:virtual_fs` mount returns `{:error, _}` here.
+  runs). A path under a `:virtual_fs` mount is unsupported here — it returns
+  `{:error, _}` when the session is idle, though it may be serviced by the backend
+  if a script happens to be running concurrently. Don't rely on either.
 
   ## Examples
 
@@ -433,7 +435,8 @@ defmodule ExBashkit.Session do
   As with `write_file/3`, `path` is resolved from the filesystem **root**,
   independent of the session's working directory; pass absolute paths. A `path`
   under a host mount reads the **real host file**; a path under a `:virtual_fs`
-  mount is not serviced here and returns `{:error, _}`.
+  mount is unsupported here (returns `{:error, _}` when idle, and is not
+  guaranteed otherwise — don't rely on it).
 
   ## Examples
 
@@ -722,7 +725,7 @@ defmodule ExBashkit.Session do
   # of one `exec/2`. It is linked so it dies with the caller (no orphan), and we
   # unlink-then-kill on teardown so our own kill never propagates to the caller.
   defp start_handler(builtins, virtual_fs) do
-    pid = spawn_link(fn -> handler_loop(builtins, virtual_fs) end)
+    pid = spawn_link(fn -> handler_loop(builtins, virtual_fs, nil) end)
 
     cleanup = fn ->
       Process.unlink(pid)
@@ -732,31 +735,43 @@ defmodule ExBashkit.Session do
     {pid, cleanup}
   end
 
-  defp handler_loop(builtins, virtual_fs) do
+  # `worker` is the process running the *current* builtin, if any (see below).
+  defp handler_loop(builtins, virtual_fs, worker) do
     receive do
       {:bashkit_call, req_id, name, args, stdin, env_pairs, cwd} ->
         # Service the builtin in a child process so THIS loop stays free to
         # receive the nested FS back-calls a builtin may trigger — e.g. the
         # `python` builtin reading a `:virtual_fs` mount routes through this same
         # handler, which would otherwise deadlock (the loop can't recv the
-        # `{:bashkit_fs, ...}` while it's blocked running the builtin). bashkit
-        # runs commands one at a time, so at most one builtin is in flight per
-        # exec. `invoke_builtin` try/rescue/catches everything and always replies,
-        # so the linked child exits normally (the link never carries a crash) and
-        # is torn down with the handler.
-        spawn_link(fn ->
-          {stdout, stderr, exit_code} =
-            invoke_builtin(builtins, name, args, stdin, env_pairs, cwd)
+        # `{:bashkit_fs, ...}` while it's blocked running the builtin).
+        #
+        # A fresh `{:bashkit_call}` means bashkit treated the previous builtin as
+        # done — it replied, or its back-call hit `:builtin_timeout_ms`. Kill a
+        # still-running previous worker (a timed-out builtin whose Elixir work
+        # outlived the timeout) so it can't run concurrently with this one. We
+        # unlink first so the untrappable `:kill` doesn't travel back up our own
+        # link, which keeps "one builtin worker at a time" true even on the
+        # timeout path. (`invoke_builtin` try/rescue/catches everything and always
+        # replies, so a worker that finishes normally has already exited.)
+        if worker && Process.alive?(worker) do
+          Process.unlink(worker)
+          Process.exit(worker, :kill)
+        end
 
-          ExBashkit.Native.builtin_reply(req_id, stdout, stderr, exit_code)
-        end)
+        next =
+          spawn_link(fn ->
+            {stdout, stderr, exit_code} =
+              invoke_builtin(builtins, name, args, stdin, env_pairs, cwd)
 
-        handler_loop(builtins, virtual_fs)
+            ExBashkit.Native.builtin_reply(req_id, stdout, stderr, exit_code)
+          end)
+
+        handler_loop(builtins, virtual_fs, next)
 
       {:bashkit_fs, req_id, mount, op, path, data, recursive} ->
         reply = invoke_fs(Map.fetch!(virtual_fs, mount), op, path, data, recursive)
         ExBashkit.Native.fs_reply(req_id, reply)
-        handler_loop(builtins, virtual_fs)
+        handler_loop(builtins, virtual_fs, worker)
     end
   end
 
