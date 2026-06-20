@@ -31,5 +31,10 @@ defmodule ExBashkitTest do
 
       assert code != 0
     end
+
+    test "jq is bundled (the bashkit `jq` feature is enabled in the NIF)" do
+      assert {:ok, %ExBashkit.Result{stdout: "42\n", exit_code: 0}} =
+               ExBashkit.exec(~s(echo '{"a":42}' | jq '.a'))
+    end
   end
 end

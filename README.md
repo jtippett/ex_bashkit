@@ -4,7 +4,7 @@ Elixir NIF wrapper for [**bashkit**](https://github.com/everruns/bashkit) — a
 sandboxed, virtual bash interpreter written in Rust.
 
 Run bash scripts safely from Elixir: ~150 builtins (`echo`, `grep`, `sed`,
-`awk`, `cat`, `find`, `sort`, …) are **reimplemented in Rust**, file I/O
+`awk`, `jq`, `cat`, `find`, `sort`, …) are **reimplemented in Rust**, file I/O
 hits an **in-memory virtual filesystem**, and there is **no `fork`/`exec`**
 escape hatch. Nothing touches the host OS unless you explicitly grant it. That
 makes it safe to run *untrusted* scripts — for example, bash written by an LLM

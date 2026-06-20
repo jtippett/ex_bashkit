@@ -46,9 +46,14 @@ rustler = "0.38"
 # into the shipped NIF (decided with the user) so network capability ships with
 # every precompiled binary. http_client is enabled through *our* `default`
 # feature above (which maps to `bashkit/http_client`), so it stays cfg-gateable.
-bashkit = { version = "=0.11.0", default-features = false, features = ["realfs"] }
+# "jq" pulls the pure-Rust `jaq` engine (jaq-core/std/json — no system deps, far
+# lighter than turso/zapcode) to power the `jq` builtin. JSON wrangling is core to
+# the LLM-agent use case; it's pure computation (no I/O/escape surface), so it
+# needs no runtime gate. Baked into the shipped NIF; not cfg-gated in our code
+# because we never reference jq from Rust (it's purely a bashkit builtin).
+bashkit = { version = "=0.11.0", default-features = false, features = ["realfs", "jq"] }
 # For local iteration against a checkout, comment the line above and use:
-# bashkit = { path = "../../../bashkit/crates/bashkit", default-features = false, features = ["realfs"] }
+# bashkit = { path = "../../../bashkit/crates/bashkit", default-features = false, features = ["realfs", "jq"] }
 
 # bashkit's `exec` is async (tokio). We host a single shared runtime and
 # block_on it from inside dirty NIFs. See src/lib.rs.

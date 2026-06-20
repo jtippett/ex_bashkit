@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Added
+
+- The `jq` builtin (JSON processing) is now bundled — bashkit's `jq` feature
+  (the pure-Rust `jaq` engine) is enabled in the precompiled NIF, so scripts can
+  pipe through `jq` (e.g. `curl … | jq '.field'`). Pure computation, no extra
+  runtime gate.
+
 ## 0.1.2 - 2026-06-20
 
 First release. An Elixir NIF wrapper around
