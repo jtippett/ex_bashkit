@@ -813,9 +813,9 @@ defmodule ExBashkit.Session do
   defp run_builtin(builtins, name, call) do
     builtins |> Map.fetch!(name) |> apply([call]) |> normalize_builtin_return(name)
   rescue
-    e -> {"", "#{name}: builtin raised: #{Exception.message(e)}\n", 1}
+    e -> {"", "#{name}: builtin raised: #{truncate_reason(Exception.message(e))}\n", 1}
   catch
-    kind, reason -> {"", "#{name}: builtin #{kind}: #{inspect(reason)}\n", 1}
+    kind, reason -> {"", "#{name}: builtin #{kind}: #{inspect_bounded(reason)}\n", 1}
   end
 
   defp normalize_builtin_return({:ok, io}, name) do
@@ -931,9 +931,9 @@ defmodule ExBashkit.Session do
     |> dispatch_fs(op, path, data, recursive)
     |> normalize_fs_reply(op)
   rescue
-    e -> {:error, "#{op}: #{Exception.message(e)}"}
+    e -> {:error, "#{op}: #{truncate_reason(Exception.message(e))}"}
   catch
-    kind, reason -> {:error, "#{op}: #{kind} #{inspect(reason)}"}
+    kind, reason -> {:error, "#{op}: #{kind} #{inspect_bounded(reason)}"}
   end
 
   defp dispatch_fs(fun, op, path, data, recursive) when is_function(fun, 1) do
@@ -1035,6 +1035,8 @@ defmodule ExBashkit.Session do
     if byte_size(reason) > cap, do: binary_part(reason, 0, cap), else: reason
   end
 
+  defp truncate_reason(reason), do: inspect_bounded(reason)
+
   defp fs_entry(name) when is_binary(name), do: {name, false}
   defp fs_entry({name, :dir}), do: {to_string(name), true}
   defp fs_entry({name, :file}), do: {to_string(name), false}
@@ -1042,7 +1044,7 @@ defmodule ExBashkit.Session do
 
   defp fs_reason(reason) when is_atom(reason), do: Atom.to_string(reason)
   defp fs_reason(reason) when is_binary(reason), do: reason
-  defp fs_reason(reason), do: inspect(reason)
+  defp fs_reason(reason), do: inspect_bounded(reason)
 
   # Validate the :virtual_fs map: absolute non-root mount paths => a 1-arity
   # function, a module, or a {module, arg} tuple.

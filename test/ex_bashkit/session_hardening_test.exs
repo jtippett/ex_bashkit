@@ -30,6 +30,16 @@ defmodule ExBashkit.SessionHardeningTest do
       assert stderr =~ "exceeds the 16-byte reply limit"
     end
 
+    test "a builtin that raises a huge message has its stderr truncated" do
+      session =
+        Session.new(builtins: %{"boom" => fn _ -> raise String.duplicate("z", 5_000) end})
+
+      assert {:ok, %Result{exit_code: 1, stderr: stderr}} = Session.exec(session, "boom")
+      # The 5000-byte exception message is truncated to the 16-byte cap before it
+      # reaches the bridge, so the surfaced stderr stays small.
+      assert byte_size(stderr) < 200
+    end
+
     test "a reply at or under the cap passes through untouched" do
       session = Session.new(builtins: %{"ok" => fn _ -> {:ok, "0123456789"} end})
 
