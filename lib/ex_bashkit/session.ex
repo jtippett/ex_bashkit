@@ -871,11 +871,21 @@ defmodule ExBashkit.Session do
     end
   end
 
-  # An error/diagnostic inspect that can't itself become an amplification vector:
-  # bound both the number of elements and the bytes rendered per term.
+  # An error/diagnostic inspect that can't itself become an amplification vector.
+  # `limit`/`printable_limit` keep a well-behaved render small, but a custom
+  # `Inspect` impl can ignore them and emit any size — so HARD-truncate the result
+  # to the byte cap. That makes this a genuine bound, not a best-effort one.
   defp inspect_bounded(term) do
-    inspect(term, limit: 20, printable_limit: 256)
+    term
+    |> inspect(limit: 20, printable_limit: 256)
+    |> truncate_binary(max_reply_bytes())
   end
+
+  # Truncate a binary to a hard byte cap. (May split a trailing multi-byte UTF-8
+  # sequence; that only ever happens on an over-cap diagnostic/error string, where
+  # a slightly-mangled tail is fine — the native side falls back to a clean error.)
+  defp truncate_binary(bin, cap) when byte_size(bin) > cap, do: binary_part(bin, 0, cap)
+  defp truncate_binary(bin, _cap), do: bin
 
   defp within_reply_cap(io) do
     if :erlang.iolist_size(io) <= max_reply_bytes() do
@@ -1030,10 +1040,8 @@ defmodule ExBashkit.Session do
     end
   end
 
-  defp truncate_reason(reason) when is_binary(reason) do
-    cap = max_reply_bytes()
-    if byte_size(reason) > cap, do: binary_part(reason, 0, cap), else: reason
-  end
+  defp truncate_reason(reason) when is_binary(reason),
+    do: truncate_binary(reason, max_reply_bytes())
 
   defp truncate_reason(reason), do: inspect_bounded(reason)
 

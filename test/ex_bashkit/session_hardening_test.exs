@@ -1,8 +1,20 @@
+defmodule ExBashkit.SessionHardeningTest.AdversarialInspect do
+  @moduledoc false
+  # A struct whose Inspect impl deliberately ignores :printable_limit and emits a
+  # large binary — to prove inspect_bounded/1 is a HARD byte cap, not best-effort.
+  defstruct []
+
+  defimpl Inspect do
+    def inspect(_value, _opts), do: String.duplicate("A", 5_000)
+  end
+end
+
 defmodule ExBashkit.SessionHardeningTest do
   # Not async: these toggle Application env (global) for the hardening knobs.
   use ExUnit.Case, async: false
 
   alias ExBashkit.{Result, Session}
+  alias ExBashkit.SessionHardeningTest.AdversarialInspect
 
   describe ":max_reply_bytes cap on builtin replies" do
     setup do
@@ -37,6 +49,15 @@ defmodule ExBashkit.SessionHardeningTest do
       assert {:ok, %Result{exit_code: 1, stderr: stderr}} = Session.exec(session, "boom")
       # The 5000-byte exception message is truncated to the 16-byte cap before it
       # reaches the bridge, so the surfaced stderr stays small.
+      assert byte_size(stderr) < 200
+    end
+
+    test "a thrown term whose Inspect impl ignores opts is still hard-truncated" do
+      session = Session.new(builtins: %{"boom" => fn _ -> throw(%AdversarialInspect{}) end})
+
+      assert {:ok, %Result{exit_code: 1, stderr: stderr}} = Session.exec(session, "boom")
+      # inspect/1 would emit 5000 bytes here (the impl ignores :printable_limit);
+      # the hard truncation to the 16-byte cap keeps it off the bridge.
       assert byte_size(stderr) < 200
     end
 
