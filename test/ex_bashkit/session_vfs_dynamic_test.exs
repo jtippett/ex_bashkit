@@ -214,6 +214,35 @@ defmodule ExBashkit.SessionVfsDynamicTest do
       assert {:ok, %Result{stdout: "ok\n"}} = Session.exec(session, "echo ok")
     end
 
+    test "a slow backend doesn't block a later back-call in the same exec" do
+      # The FS op runs in a brutal-killed child, so the handler loop stays free:
+      # a builtin invoked *after* a timed-out slow read is still serviced within
+      # the same script. (When the FS op ran synchronously in the loop, this
+      # builtin queued behind the 2s sleep and timed out too.)
+      slow_read =
+        fn
+          %{op: :read} ->
+            Process.sleep(2_000)
+            {:ok, "slow\n"}
+
+          %{op: :stat} ->
+            {:ok, %{type: :file, size: 5}}
+
+          _ ->
+            {:error, :enotsup}
+        end
+
+      session =
+        Session.new(
+          builtin_timeout_ms: 200,
+          builtins: %{"after_slow" => fn _ -> {:ok, "ran\n"} end},
+          virtual_fs: %{"/slow" => slow_read}
+        )
+
+      assert {:ok, %Result{stdout: stdout}} = Session.exec(session, "cat /slow/x; after_slow")
+      assert stdout =~ "ran"
+    end
+
     test "a backend cancelled by the script timeout doesn't wedge the session" do
       # bashkit's own execution timeout fires while the FS back-call is parked,
       # dropping the exec future; PendingFsCleanup must free the slot and the

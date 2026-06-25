@@ -786,9 +786,33 @@ defmodule ExBashkit.Session do
         handler_loop(builtins, virtual_fs, timeout)
 
       {:bashkit_fs, req_id, mount, op, path, data, recursive} ->
-        reply = invoke_fs(Map.fetch!(virtual_fs, mount), op, path, data, recursive)
-        ExBashkit.Native.fs_reply(req_id, reply)
+        # Service the FS op in a child too — symmetric with builtins above — so a
+        # slow `:virtual_fs` backend (these often proxy real stores, so blocking is
+        # expected) can't pin this loop and stall later back-calls in the same exec,
+        # and `invoke_fs_bounded/6` brutal-kills it at `:builtin_timeout_ms` so it
+        # can't keep running and land a write after Rust already abandoned the op.
+        spec = Map.fetch!(virtual_fs, mount)
+
+        spawn_link(fn ->
+          reply = invoke_fs_bounded(spec, op, path, data, recursive, timeout)
+          ExBashkit.Native.fs_reply(req_id, reply)
+        end)
+
         handler_loop(builtins, virtual_fs, timeout)
+    end
+  end
+
+  # Run one FS op, bounded to `timeout`, returning a normalized wire reply. Mirrors
+  # `invoke_builtin/7`: the work runs in an inner Task so a backend that exceeds
+  # `:builtin_timeout_ms` is brutally killed at the timeout (surfaced as an I/O
+  # error for that op) instead of running on. Rust independently times the op out,
+  # so a late reply for an already-abandoned req_id is harmlessly dropped.
+  defp invoke_fs_bounded(spec, op, path, data, recursive, timeout) do
+    task = Task.async(fn -> invoke_fs(spec, op, path, data, recursive) end)
+
+    case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
+      {:ok, reply} -> reply
+      _ -> {:error, "#{op}: backend timed out after #{timeout}ms"}
     end
   end
 
