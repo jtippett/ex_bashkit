@@ -10,6 +10,10 @@ defmodule ExBashkit.MixProject do
       version: @version,
       elixir: "~> 1.15",
       start_permanent: Mix.env() == :prod,
+      # Don't consolidate protocols in :test so a test can `defimpl` a protocol
+      # (the hardening suite defines an adversarial `Inspect` impl to prove the
+      # reply cap hard-truncates even when a custom impl ignores inspect's opts).
+      consolidate_protocols: Mix.env() != :test,
       deps: deps(),
       package: package(),
       docs: docs(),
