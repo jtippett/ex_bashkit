@@ -366,6 +366,37 @@ It's the same design philosophy as its sibling
 language runs inert, and the host grants capabilities. bashkit even embeds monty
 for its optional `python` builtin.
 
+## Running untrusted scripts at scale
+
+Each `exec` runs the interpreter synchronously inside a *dirty scheduler thread*
+for the script's whole duration. The dirty pool is bounded (roughly one thread
+per scheduler), so unbounded concurrency of untrusted — possibly slow — scripts
+can occupy every dirty thread until they time out. Three knobs harden a node that
+runs untrusted scripts under load (all have safe defaults):
+
+```elixir
+# config/config.exs
+config :ex_bashkit,
+  max_timeout_ms: 60_000,       # hard ceiling on any session's :timeout_ms
+  max_reply_bytes: 16_000_000,  # cap on a single builtin / :virtual_fs reply
+  pool_size: 8,                 # ExBashkit.Pool permits (default: schedulers_online)
+  pool_max_queue: 100           # queue depth before {:error, :overloaded}
+```
+
+`ExBashkit.Pool` is an opt-in, supervised gate that caps how many scripts run
+concurrently. Add it to your supervision tree and route untrusted runs through it;
+work past the queue is shed rather than piled onto exhausted schedulers:
+
+```elixir
+children = [{ExBashkit.Pool, size: 8, max_queue: 100}]
+
+ExBashkit.Pool.run(fn -> ExBashkit.Session.exec(session, script) end)
+# => {:ok, %ExBashkit.Result{}} | {:error, :overloaded}
+```
+
+See the "Hardening for untrusted load" section of `ExBashkit.Session` for the
+full rationale.
+
 ## Security model
 
 - **Filesystem:** in-memory virtual FS; no host paths are reachable unless you
@@ -375,7 +406,14 @@ for its optional `python` builtin.
 - **Network:** off by default; opt-in per-URL allowlist (`:allow_net`) with
   redirect-blocking and private-IP/SSRF protection enforced by bashkit.
 - **Resource limits:** command count, loop iterations, recursion depth, input
-  size, and a wall-clock timeout — tunable per session via `:limits`.
+  size, and a wall-clock timeout — tunable per session via `:limits`, with an
+  optional `:max_timeout_ms` ceiling enforced node-wide.
+- **Back-call bridge:** custom-builtin and `:virtual_fs` replies are bounded by
+  `:max_reply_bytes` before crossing the native boundary, and a slow/misbehaving
+  handler is bounded by `:builtin_timeout_ms` (and killed on timeout) — one
+  command fails, never the VM.
+- **Concurrency:** `ExBashkit.Pool` caps concurrent runs so untrusted load can't
+  exhaust the dirty-scheduler pool.
 - **Isolation:** each `exec/1` runs in an independent sandbox; a
   `Session` is an independent sandbox that persists across its own calls.
 
