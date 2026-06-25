@@ -2,6 +2,33 @@
 
 ## [Unreleased]
 
+### Added
+
+- `ExBashkit.Pool` — an optional, supervised bounded-concurrency gate for running
+  untrusted scripts under load. Each `exec` occupies a dirty scheduler thread for
+  the script's duration, so unbounded concurrency of untrusted scripts can exhaust
+  the (bounded) dirty pool. The pool caps concurrent runs with permits plus a
+  bounded queue, shedding excess load with `{:error, :overloaded}`. Opt in by
+  adding it to your supervision tree; `:size` / `:max_queue` are configurable via
+  child-spec options or `config :ex_bashkit, pool_size: …, pool_max_queue: …`.
+- Application-environment hardening knobs for nodes running untrusted scripts:
+  `:max_reply_bytes` (cap on a single custom-builtin / `:virtual_fs` reply;
+  default 16 MB) and `:max_timeout_ms` (a hard ceiling every session's
+  `:timeout_ms` must respect; default `nil` — no ceiling). See the "Hardening for
+  untrusted load" section of `ExBashkit.Session`.
+
+### Changed
+
+- Custom-builtin and `:virtual_fs` replies are now bounded by `:max_reply_bytes`
+  before crossing the native boundary: an oversized reply fails that one
+  command/op instead of being copied across the bridge. Covers builtin
+  stdout/stderr, error/diagnostic strings, and virtual-filesystem reads and
+  directory listings.
+- `:virtual_fs` back-calls now run in a child process bounded by
+  `:builtin_timeout_ms` (brutal-killed on timeout), matching custom builtins. A
+  slow backend no longer blocks later back-calls in the same `exec`, and can no
+  longer land a write after the operation has already timed out.
+
 ## 0.1.3 - 2026-06-20
 
 ### Added
