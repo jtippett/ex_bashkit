@@ -15,11 +15,16 @@ defmodule ExBashkit do
       iex> ExBashkit.exec("echo hello | tr a-z A-Z")
       {:ok, %ExBashkit.Result{stdout: "HELLO\\n", stderr: "", exit_code: 0}}
 
-  > #### Skeleton {: .warning}
-  >
-  > This is an early scaffold. Only stateless `exec/1` is wired up. Persistent
-  > sessions, virtual-filesystem mounts, resource limits, a network allowlist,
-  > and Elixir-defined custom builtins are planned — see `PORTING.md`.
+  `exec/1` is stateless: each call runs in a fresh interpreter with no host
+  filesystem and no network. For state that persists across calls — environment,
+  cwd, an in-memory filesystem, shell functions — plus the capability options
+  (resource limits, host mounts, a network allowlist, Elixir-defined custom
+  builtins, virtual-filesystem backends, and snapshot/restore), use
+  `ExBashkit.Session`.
+
+  When running untrusted scripts under concurrent load, see the "Hardening for
+  untrusted load" section of `ExBashkit.Session` and the optional
+  `ExBashkit.Pool`.
   """
 
   alias ExBashkit.Result
