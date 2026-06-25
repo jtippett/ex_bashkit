@@ -149,6 +149,31 @@ defmodule ExBashkit.Session do
   Count limits must be non-negative integers (a value past the platform maximum
   means "unlimited"); unknown keys raise `ArgumentError`.
 
+  ## Hardening for untrusted load
+
+  Three application-level knobs harden a node that runs untrusted scripts at
+  scale. All have safe defaults; set them in config:
+
+      config :ex_bashkit,
+        max_timeout_ms: 60_000,      # hard ceiling on any session's :timeout_ms
+        max_reply_bytes: 16_000_000  # cap on a single builtin/virtual_fs reply
+
+    * `:max_timeout_ms` — a hard ceiling every session's `:timeout_ms` must
+      respect. Because a running script pins a dirty scheduler thread for its
+      whole duration, an over-large `:timeout_ms` lets one script monopolize a
+      (bounded) dirty thread for that long. With a ceiling set, `new/1` raises if a
+      session asks for more. Default `nil` (no ceiling; bashkit's own 30s default
+      still applies to sessions that set no `:timeout_ms`).
+    * `:max_reply_bytes` — the largest value a custom `:builtins` or `:virtual_fs`
+      handler may return for one call (builtin stdout/stderr, or a virtual-FS read
+      or directory listing). An oversized reply fails that one command/op rather
+      than being copied across the native bridge. Default 16 MB.
+
+  Neither bounds *how many* scripts run at once. Because each `exec/2` occupies a
+  dirty scheduler thread, unbounded concurrency of untrusted scripts can occupy
+  every dirty thread until they time out. To cap concurrency (and shed load past a
+  queue), run scripts through `ExBashkit.Pool`.
+
   ## Custom builtins
 
   `:builtins` registers Elixir-defined **virtual executables**: a script line
@@ -187,8 +212,9 @@ defmodule ExBashkit.Session do
   Anything else is treated as a contract violation: the command fails (exit `1`)
   with a descriptive stderr message rather than crashing the session.
 
-  **Robustness.** A builtin that raises, or runs longer than `:builtin_timeout_ms`
-  (exit `124`), fails only *that command* — the session stays usable.
+  **Robustness.** A builtin that raises, runs longer than `:builtin_timeout_ms`
+  (exit `124`), or returns more than `:max_reply_bytes` (see "Hardening for
+  untrusted load") fails only *that command* — the session stays usable.
 
   **No reentrancy.** A builtin handler must not call `exec/2` on the *same*
   session; that exec already holds the session's lock, so the call would block.
@@ -792,20 +818,61 @@ defmodule ExBashkit.Session do
     kind, reason -> {"", "#{name}: builtin #{kind}: #{inspect(reason)}\n", 1}
   end
 
-  defp normalize_builtin_return({:ok, io}, _name), do: {IO.iodata_to_binary(io), "", 0}
-  defp normalize_builtin_return({:error, io}, _name), do: {"", IO.iodata_to_binary(io), 1}
+  defp normalize_builtin_return({:ok, io}, name) do
+    case within_reply_cap(io) do
+      {:ok, bin} -> {bin, "", 0}
+      :too_large -> reply_too_large(name)
+    end
+  end
 
-  defp normalize_builtin_return(%Result{stdout: out, stderr: err, exit_code: code}, _name)
+  defp normalize_builtin_return({:error, io}, name) do
+    case within_reply_cap(io) do
+      {:ok, bin} -> {"", bin, 1}
+      :too_large -> reply_too_large(name)
+    end
+  end
+
+  defp normalize_builtin_return(%Result{stdout: out, stderr: err, exit_code: code}, name)
        when is_integer(code) do
     # Mask to a byte like a real shell (exit codes are mod 256). This is also a
     # safety net: the reply NIF takes an i32, so an out-of-range integer here
     # would otherwise raise in the handler process and (being linked) take the
     # caller down — exactly the "a builtin must never wedge the session" hole.
-    {IO.iodata_to_binary(out || ""), IO.iodata_to_binary(err || ""), Bitwise.band(code, 0xFF)}
+    with {:ok, out_bin} <- within_reply_cap(out || ""),
+         {:ok, err_bin} <- within_reply_cap(err || "") do
+      {out_bin, err_bin, Bitwise.band(code, 0xFF)}
+    else
+      :too_large -> reply_too_large(name)
+    end
   end
 
   defp normalize_builtin_return(other, name) do
     {"", "#{name}: builtin returned an invalid value: #{inspect(other)}\n", 1}
+  end
+
+  # Guard the back-call bridge against an OOM-amplification: a handler returning a
+  # very large value would be copied into a Rust `Vec` (and a lossy `String`),
+  # doubling its footprint, before bashkit's own 1MB output cap could truncate it.
+  # Measure the iodata *without* materializing it and reject oversize replies as a
+  # failed command rather than letting the copy reach the NIF. The cap is read
+  # from config so operators can tune it; the 16MB default sits above bashkit's
+  # 10MB max single-file size so legitimate large virtual-FS reads still pass.
+  @default_max_reply_bytes 16_000_000
+
+  defp max_reply_bytes do
+    Application.get_env(:ex_bashkit, :max_reply_bytes, @default_max_reply_bytes)
+  end
+
+  defp within_reply_cap(io) do
+    if :erlang.iolist_size(io) <= max_reply_bytes() do
+      {:ok, IO.iodata_to_binary(io)}
+    else
+      :too_large
+    end
+  end
+
+  defp reply_too_large(name) do
+    {"", "#{name}: builtin output exceeds the #{max_reply_bytes()}-byte reply limit\n", 1}
   end
 
   # Validate the :builtins map: string names mapped to arity-1 functions.
@@ -890,10 +957,29 @@ defmodule ExBashkit.Session do
   #   :ok | {:ok_bytes, bin} | {:ok_list, [{name, is_dir?}]} | {:ok_stat, is_dir?, size}
   #   | {:error, reason_string}
   defp normalize_fs_reply(:ok, _op), do: :ok
-  defp normalize_fs_reply({:ok, content}, :read), do: {:ok_bytes, IO.iodata_to_binary(content)}
 
-  defp normalize_fs_reply({:ok, entries}, :list) when is_list(entries),
-    do: {:ok_list, Enum.map(entries, &fs_entry/1)}
+  defp normalize_fs_reply({:ok, content}, :read) do
+    # Same OOM-amplification guard as builtin replies: a backend returning a huge
+    # binary for a `cat /mount/...` would be copied across the bridge before any
+    # cap applied. Reject oversize reads as an I/O error for that op.
+    case within_reply_cap(content) do
+      {:ok, bin} -> {:ok_bytes, bin}
+      :too_large -> {:error, "read exceeds the #{max_reply_bytes()}-byte reply limit"}
+    end
+  end
+
+  defp normalize_fs_reply({:ok, entries}, :list) when is_list(entries) do
+    # Same bridge cap as :read — a backend returning a vast listing (or huge entry
+    # names) is the same amplification class. Bound the total name bytes.
+    mapped = Enum.map(entries, &fs_entry/1)
+    bytes = Enum.reduce(mapped, 0, fn {name, _is_dir}, acc -> acc + byte_size(name) end)
+
+    if bytes <= max_reply_bytes() do
+      {:ok_list, mapped}
+    else
+      {:error, "list exceeds the #{max_reply_bytes()}-byte reply limit"}
+    end
+  end
 
   defp normalize_fs_reply({:ok, %{type: type, size: size}}, :stat)
        when type in [:file, :dir] and is_integer(size) and size >= 0,
@@ -978,11 +1064,42 @@ defmodule ExBashkit.Session do
       raise ArgumentError, "limit :timeout_ms must be at least 1 (0 would time out immediately)"
     end
 
+    enforce_timeout_ceiling!(map)
+
     map
   end
 
   defp normalize_limits(other) do
     raise ArgumentError, ":limits must be a keyword list or map, got: #{inspect(other)}"
+  end
+
+  # A running script holds a dirty scheduler thread for its whole duration, so an
+  # over-large `:timeout_ms` lets one untrusted script monopolize a (bounded) dirty
+  # thread for that long. Operators that run untrusted scripts can set a hard
+  # ceiling — `config :ex_bashkit, max_timeout_ms: 60_000` — that every session's
+  # `:timeout_ms` must respect; we raise loudly on a violation rather than silently
+  # clamp. The default `nil` imposes no ceiling (bashkit's own 30s default applies
+  # to sessions that set no `:timeout_ms`).
+  defp enforce_timeout_ceiling!(map) do
+    case Application.get_env(:ex_bashkit, :max_timeout_ms) do
+      nil ->
+        :ok
+
+      max when is_integer(max) and max > 0 ->
+        case Map.get(map, :timeout_ms) do
+          t when is_integer(t) and t > max ->
+            raise ArgumentError,
+                  "limit :timeout_ms #{t} exceeds the configured :max_timeout_ms ceiling of #{max}"
+
+          _ ->
+            :ok
+        end
+
+      other ->
+        raise ArgumentError,
+              "config :ex_bashkit, :max_timeout_ms must be a positive integer or nil, " <>
+                "got: #{inspect(other)}"
+    end
   end
 
   # Stringify each {vfs, host, mode} mount tuple for the NIF; `to_string/1`
