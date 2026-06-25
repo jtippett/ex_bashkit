@@ -10,6 +10,15 @@ defmodule ExBashkit.PoolTest do
     name
   end
 
+  # Poll a condition instead of sleeping a fixed time.
+  defp wait_until(fun, tries \\ 200) do
+    cond do
+      fun.() -> :ok
+      tries == 0 -> flunk("condition not met in time")
+      true -> Process.sleep(1) && wait_until(fun, tries - 1)
+    end
+  end
+
   # Spawn a worker that runs a gated fun under the pool. The fun signals the test
   # when it starts running, then blocks until told to finish — so we can observe
   # concurrency without sleeping. Returns the worker pid (where the fun runs).
@@ -107,6 +116,29 @@ defmodule ExBashkit.PoolTest do
     # so success below can only come from release-after-raise — not a lucky race.
     assert_receive :acquired
     assert Pool.run(pool, fn -> :ok end) == :ok
+  end
+
+  test "a waiter that dies while queued is dropped, leaving the pool healthy" do
+    pool = start_pool(size: 1, max_queue: 5)
+
+    a = spawn_gated(pool)
+    assert_receive {:running, ^a}
+
+    # b blocks in the queue behind a's permit.
+    b = spawn(fn -> Pool.run(pool, fn -> Process.sleep(:infinity) end) end)
+    wait_until(fn -> :queue.len(:sys.get_state(pool).waiting) == 1 end)
+
+    Process.exit(b, :kill)
+    wait_until(fn -> :queue.len(:sys.get_state(pool).waiting) == 0 end)
+
+    # The pool still grants the permit normally to a fresh caller once a frees it.
+    send(a, :finish)
+    assert_receive {:done, ^a, :result}
+
+    c = spawn_gated(pool)
+    assert_receive {:running, ^c}
+    send(c, :finish)
+    assert_receive {:done, ^c, :result}
   end
 
   test "a reentrant run on the same pool raises instead of deadlocking" do

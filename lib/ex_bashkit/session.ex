@@ -847,7 +847,7 @@ defmodule ExBashkit.Session do
   end
 
   defp normalize_builtin_return(other, name) do
-    {"", "#{name}: builtin returned an invalid value: #{inspect(other)}\n", 1}
+    {"", "#{name}: builtin returned an invalid value: #{inspect_bounded(other)}\n", 1}
   end
 
   # Guard the back-call bridge against an OOM-amplification: a handler returning a
@@ -859,8 +859,22 @@ defmodule ExBashkit.Session do
   # 10MB max single-file size so legitimate large virtual-FS reads still pass.
   @default_max_reply_bytes 16_000_000
 
+  # Read the cap, failing CLOSED: an absent key, an explicit `nil`, or any
+  # non-positive-integer value falls back to the default rather than disabling the
+  # cap. (Erlang term ordering makes `int <= nil` / `int <= "x"` *true*, so a naive
+  # comparison against a misconfigured value would silently let everything through
+  # — the opposite of what a byte cap is for.)
   defp max_reply_bytes do
-    Application.get_env(:ex_bashkit, :max_reply_bytes, @default_max_reply_bytes)
+    case Application.get_env(:ex_bashkit, :max_reply_bytes, @default_max_reply_bytes) do
+      n when is_integer(n) and n > 0 -> n
+      _ -> @default_max_reply_bytes
+    end
+  end
+
+  # An error/diagnostic inspect that can't itself become an amplification vector:
+  # bound both the number of elements and the bytes rendered per term.
+  defp inspect_bounded(term) do
+    inspect(term, limit: 20, printable_limit: 256)
   end
 
   defp within_reply_cap(io) do
@@ -969,15 +983,14 @@ defmodule ExBashkit.Session do
   end
 
   defp normalize_fs_reply({:ok, entries}, :list) when is_list(entries) do
-    # Same bridge cap as :read — a backend returning a vast listing (or huge entry
-    # names) is the same amplification class. Bound the total name bytes.
-    mapped = Enum.map(entries, &fs_entry/1)
-    bytes = Enum.reduce(mapped, 0, fn {name, _is_dir}, acc -> acc + byte_size(name) end)
-
-    if bytes <= max_reply_bytes() do
-      {:ok_list, mapped}
-    else
-      {:error, "list exceeds the #{max_reply_bytes()}-byte reply limit"}
+    # Same bridge cap as :read, but a name-bytes-only count undercounts the real
+    # cost: a flood of tiny names still forces a huge list/tuple allocation on both
+    # the BEAM and Rust sides. Charge each entry its name bytes plus a fixed
+    # per-entry overhead, and bail mid-traversal so we never materialize the whole
+    # mapped list before rejecting it.
+    case cap_list(entries, max_reply_bytes()) do
+      {:ok, mapped} -> {:ok_list, mapped}
+      :too_large -> {:error, "list exceeds the #{max_reply_bytes()}-byte reply limit"}
     end
   end
 
@@ -985,10 +998,42 @@ defmodule ExBashkit.Session do
        when type in [:file, :dir] and is_integer(size) and size >= 0,
        do: {:ok_stat, type == :dir, size}
 
-  defp normalize_fs_reply({:error, reason}, _op), do: {:error, fs_reason(reason)}
+  # The reason string crosses the bridge too — truncate it so a backend returning a
+  # huge `{:error, big_binary}` can't amplify on an error path.
+  defp normalize_fs_reply({:error, reason}, _op),
+    do: {:error, truncate_reason(fs_reason(reason))}
 
   defp normalize_fs_reply(other, op),
-    do: {:error, "#{op}: backend returned an invalid value: #{inspect(other)}"}
+    do: {:error, "#{op}: backend returned an invalid value: #{inspect_bounded(other)}"}
+
+  # A conservative per-entry charge covering the cons cell, tuple, and boolean a
+  # single listing entry expands to once decoded — so the count, not just the name
+  # bytes, is bounded.
+  @list_entry_overhead 24
+
+  defp cap_list(entries, cap) do
+    result =
+      Enum.reduce_while(entries, {0, []}, fn entry, {weight, acc} ->
+        {name, _is_dir} = mapped = fs_entry(entry)
+        weight = weight + byte_size(name) + @list_entry_overhead
+
+        if weight > cap do
+          {:halt, :too_large}
+        else
+          {:cont, {weight, [mapped | acc]}}
+        end
+      end)
+
+    case result do
+      :too_large -> :too_large
+      {_weight, acc} -> {:ok, Enum.reverse(acc)}
+    end
+  end
+
+  defp truncate_reason(reason) when is_binary(reason) do
+    cap = max_reply_bytes()
+    if byte_size(reason) > cap, do: binary_part(reason, 0, cap), else: reason
+  end
 
   defp fs_entry(name) when is_binary(name), do: {name, false}
   defp fs_entry({name, :dir}), do: {to_string(name), true}

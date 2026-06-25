@@ -66,6 +66,67 @@ defmodule ExBashkit.SessionHardeningTest do
       assert {:ok, %Result{exit_code: code}} = Session.exec(session, "ls /v")
       assert code != 0
     end
+
+    test "an over-cap virtual_fs error reason is truncated, not copied whole" do
+      session =
+        Session.new(
+          virtual_fs: %{
+            "/v" => fn %{op: :read} -> {:error, String.duplicate("x", 5_000)} end
+          }
+        )
+
+      assert {:ok, %Result{exit_code: code, stderr: stderr}} = Session.exec(session, "cat /v/f")
+      assert code != 0
+      # The 5000-byte reason was truncated to the 16-byte cap before crossing the
+      # bridge, so the surfaced error stays small.
+      assert byte_size(stderr) < 200
+    end
+  end
+
+  describe ":max_reply_bytes fails closed on misconfiguration" do
+    test "an explicit nil does not disable the cap" do
+      Application.put_env(:ex_bashkit, :max_reply_bytes, nil)
+      on_exit(fn -> Application.delete_env(:ex_bashkit, :max_reply_bytes) end)
+
+      big = String.duplicate("A", 16_000_001)
+
+      session =
+        Session.new(
+          builtins: %{
+            "big" => fn _ -> {:ok, big} end,
+            "small" => fn _ -> {:ok, "hi"} end
+          }
+        )
+
+      # Over the default cap -> still rejected (nil did NOT mean "unlimited").
+      assert {:ok, %Result{exit_code: 1, stderr: stderr}} = Session.exec(session, "big")
+      assert stderr =~ "exceeds"
+      # Normal replies still flow.
+      assert {:ok, %Result{stdout: "hi"}} = Session.exec(session, "small")
+    end
+  end
+
+  describe ":list cap counts per-entry overhead, not just name bytes" do
+    test "many tiny names are rejected even when their bytes fit the cap" do
+      Application.put_env(:ex_bashkit, :max_reply_bytes, 50)
+      on_exit(fn -> Application.delete_env(:ex_bashkit, :max_reply_bytes) end)
+
+      # 10 one-byte names = 10 bytes (under 50), but 10 entries * overhead is over.
+      names = for i <- 1..10, do: <<?a + i>>
+
+      session =
+        Session.new(
+          virtual_fs: %{
+            "/v" => fn
+              %{op: :list} -> {:ok, names}
+              %{op: :stat} -> {:ok, %{type: :dir, size: 0}}
+            end
+          }
+        )
+
+      assert {:ok, %Result{exit_code: code}} = Session.exec(session, "ls /v")
+      assert code != 0
+    end
   end
 
   describe ":max_timeout_ms ceiling" do
