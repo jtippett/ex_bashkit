@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## 0.1.4 - 2026-06-26
+
 ### Added
 
 - `ExBashkit.Pool` — an optional, supervised bounded-concurrency gate for running
