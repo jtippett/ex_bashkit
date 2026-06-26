@@ -12,7 +12,7 @@ defmodule ExBashkit.Python do
 
   Requires the optional `:ex_monty` dependency (the sandboxed Python interpreter);
   `python: true` raises if it is not available. Python's filesystem/`os`
-  operations are routed to the session via `ExBashkit.Python.SessionFs`; all other
+  operations are routed to the session's virtual filesystem; all other
   effects (network, clocks) are denied.
 
   ## Limitations (v1)

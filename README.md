@@ -435,7 +435,7 @@ CI runs `mix format --check-formatted`, `cargo fmt --check`,
 
 ## Roadmap
 
-See [`PORTING.md`](PORTING.md) for the staged plan. In brief:
+See [`PORTING.md`](https://github.com/jtippett/ex_bashkit/blob/master/PORTING.md) for the staged plan. In brief:
 
 1. ✅ Stateless `exec/1` (skeleton, proves the toolchain)
 2. ✅ Persistent sessions (state across calls)
@@ -456,7 +456,7 @@ See [`PORTING.md`](PORTING.md) for the staged plan. In brief:
 
 ExBashkit pins an exact bashkit version and vendors no logic — all execution
 semantics come from upstream. Version bumps follow
-[`UPDATE_PROCEDURE.md`](UPDATE_PROCEDURE.md).
+[`UPDATE_PROCEDURE.md`](https://github.com/jtippett/ex_bashkit/blob/master/UPDATE_PROCEDURE.md).
 
 ## Releasing
 
@@ -493,7 +493,7 @@ approve the **`hex`** environment. On approval it generates
 Keep notes under `## [Unreleased]` in `CHANGELOG.md` as you work — the assistant
 rolls them into each release. Don't commit the checksum file or move a published
 tag by hand; the pipeline owns both. See
-[`UPDATE_PROCEDURE.md`](UPDATE_PROCEDURE.md) for bumping the pinned bashkit version.
+[`UPDATE_PROCEDURE.md`](https://github.com/jtippett/ex_bashkit/blob/master/UPDATE_PROCEDURE.md) for bumping the pinned bashkit version.
 
 ## License
 
