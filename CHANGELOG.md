@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## 0.1.5 - 2026-07-15
+
 ### Changed
 
 - Updated the bundled bashkit interpreter to **0.13.0** (from 0.11.0). No changes
