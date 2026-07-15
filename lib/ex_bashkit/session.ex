@@ -50,8 +50,8 @@ defmodule ExBashkit.Session do
     * `:builtins` - a map of `name => fun` registering Elixir-defined virtual
       executables a script can invoke (see "Custom builtins" below).
     * `:builtin_timeout_ms` - how long a single custom-builtin back-call may run
-      before it is abandoned (positive integer, default `30_000`). Also bounds
-      `:virtual_fs` back-calls.
+      before it is abandoned (integer `1..4_294_967_295`, default `30_000`). Also
+      bounds `:virtual_fs` back-calls.
     * `:virtual_fs` - a map of `mount_path => backend` mounting Elixir-backed
       filesystems whose reads and writes are serviced by your application (see
       "Virtual filesystem backends" below and `ExBashkit.VirtualFs`).
@@ -212,9 +212,10 @@ defmodule ExBashkit.Session do
   Anything else is treated as a contract violation: the command fails (exit `1`)
   with a descriptive stderr message rather than crashing the session.
 
-  **Robustness.** A builtin that raises, runs longer than `:builtin_timeout_ms`
-  (exit `124`), or returns more than `:max_reply_bytes` (see "Hardening for
-  untrusted load") fails only *that command* — the session stays usable.
+  **Robustness.** A builtin that raises or exits, runs longer than
+  `:builtin_timeout_ms` (exit `124`), or returns more than `:max_reply_bytes`
+  (see "Hardening for untrusted load") fails only *that command* — the session
+  stays usable.
 
   **No reentrancy.** A builtin handler must not call `exec/2` on the *same*
   session; that exec already holds the session's lock, so the call would block.
@@ -364,6 +365,8 @@ defmodule ExBashkit.Session do
   end
 
   defp validate_python_names!(python_names, builtins) do
+    Enum.each(python_names, &validate_builtin_name!(&1, "python builtin name"))
+
     case Enum.filter(python_names, &Map.has_key?(builtins, &1)) do
       [] ->
         :ok
@@ -771,14 +774,16 @@ defmodule ExBashkit.Session do
         # `{:bashkit_fs, ...}` while it's blocked running the builtin).
         #
         # The worker bounds its *own* run to `:builtin_timeout_ms` (see
-        # `invoke_builtin/7`), brutal-killing the builtin's work at the timeout —
+        # `invoke_builtin/8`), brutal-killing the builtin's work at the timeout —
         # so a timed-out builtin can't keep running (and landing side effects)
         # during later commands. The worker is linked, so it also dies with the
-        # handler on teardown; it never carries a crash back (the inner task is
-        # isolated and the body always replies).
+        # handler on teardown; the inner child's exits are trapped and normalized,
+        # so callback failure never propagates back through the link chain.
+        handler = self()
+
         spawn_link(fn ->
           {stdout, stderr, exit_code} =
-            invoke_builtin(builtins, name, args, stdin, env_pairs, cwd, timeout)
+            invoke_builtin(builtins, name, args, stdin, env_pairs, cwd, timeout, handler)
 
           ExBashkit.Native.builtin_reply(req_id, stdout, stderr, exit_code)
         end)
@@ -789,12 +794,14 @@ defmodule ExBashkit.Session do
         # Service the FS op in a child too — symmetric with builtins above — so a
         # slow `:virtual_fs` backend (these often proxy real stores, so blocking is
         # expected) can't pin this loop and stall later back-calls in the same exec,
-        # and `invoke_fs_bounded/6` brutal-kills it at `:builtin_timeout_ms` so it
+        # and `invoke_fs_bounded/7` brutal-kills it at `:builtin_timeout_ms` so it
         # can't keep running and land a write after Rust already abandoned the op.
         spec = Map.fetch!(virtual_fs, mount)
 
+        handler = self()
+
         spawn_link(fn ->
-          reply = invoke_fs_bounded(spec, op, path, data, recursive, timeout)
+          reply = invoke_fs_bounded(spec, op, path, data, recursive, timeout, handler)
           ExBashkit.Native.fs_reply(req_id, reply)
         end)
 
@@ -803,32 +810,98 @@ defmodule ExBashkit.Session do
   end
 
   # Run one FS op, bounded to `timeout`, returning a normalized wire reply. Mirrors
-  # `invoke_builtin/7`: the work runs in an inner Task so a backend that exceeds
-  # `:builtin_timeout_ms` is brutally killed at the timeout (surfaced as an I/O
-  # error for that op) instead of running on. Rust independently times the op out,
-  # so a late reply for an already-abandoned req_id is harmlessly dropped.
-  defp invoke_fs_bounded(spec, op, path, data, recursive, timeout) do
-    task = Task.async(fn -> invoke_fs(spec, op, path, data, recursive) end)
-
-    case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
+  # `invoke_builtin/8`: the work runs in an inner monitored process so a backend
+  # that exceeds `:builtin_timeout_ms` is brutally killed at the timeout (surfaced
+  # as an I/O error for that op) instead of running on. Rust independently times
+  # the op out, so a late reply for an already-abandoned req_id is harmlessly
+  # dropped.
+  defp invoke_fs_bounded(spec, op, path, data, recursive, timeout, handler) do
+    case run_bounded(fn -> invoke_fs(spec, op, path, data, recursive) end, timeout, handler) do
       {:ok, reply} -> reply
-      _ -> {:error, "#{op}: backend timed out after #{timeout}ms"}
+      :timeout -> {:error, "#{op}: backend timed out after #{timeout}ms"}
+      {:exit, reason} -> {:error, "#{op}: backend stopped: #{inspect_bounded(reason)}"}
     end
   end
 
   # Run one builtin, bounded to `timeout`, and normalize its result to
-  # {stdout, stderr, exit_code}. The work runs in an inner Task so a builtin that
-  # exceeds `:builtin_timeout_ms` is *brutally killed at the timeout* (exit 124),
-  # rather than running on — and landing side effects — during later commands.
-  # The handler stays free meanwhile: only this worker process blocks on the Task,
-  # so a builtin's nested FS back-calls are still serviced.
-  defp invoke_builtin(builtins, name, args, stdin, env_pairs, cwd, timeout) do
+  # {stdout, stderr, exit_code}. The work runs in an inner monitored process so a
+  # builtin that exceeds `:builtin_timeout_ms` is *brutally killed at the timeout*
+  # (exit 124), rather than running on — and landing side effects — during later
+  # commands. The handler stays free meanwhile: only this worker process waits, so
+  # a builtin's nested FS back-calls are still serviced.
+  defp invoke_builtin(builtins, name, args, stdin, env_pairs, cwd, timeout, handler) do
     call = %{args: args, stdin: stdin, env: Map.new(env_pairs), cwd: cwd}
-    task = Task.async(fn -> run_builtin(builtins, name, call) end)
 
-    case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
+    case run_bounded(fn -> run_builtin(builtins, name, call) end, timeout, handler) do
       {:ok, result} -> result
-      _ -> {"", "#{name}: builtin timed out after #{timeout}ms\n", 124}
+      :timeout -> {"", "#{name}: builtin timed out after #{timeout}ms\n", 124}
+      {:exit, reason} -> {"", "#{name}: builtin stopped: #{inspect_bounded(reason)}\n", 1}
+    end
+  end
+
+  # Run callback work in a linked+monitored child while trapping its exit in this
+  # short-lived worker. The trap turns an uncatchable callback exit such as
+  # `Process.exit(self(), :kill)` into a bounded command/I/O error instead of
+  # letting it climb worker -> handler -> `Session.exec/2` caller. The downward
+  # link is intentional: if a script timeout tears down `handler`, we kill the
+  # callback child too, so it cannot outlive the exec and land late side effects.
+  defp run_bounded(fun, timeout, handler) do
+    Process.flag(:trap_exit, true)
+    parent = self()
+    result_ref = make_ref()
+
+    {pid, monitor_ref} =
+      :erlang.spawn_opt(
+        fn ->
+          send(parent, {result_ref, fun.()})
+        end,
+        [:link, :monitor]
+      )
+
+    receive do
+      {^result_ref, result} ->
+        Process.demonitor(monitor_ref, [:flush])
+        {:ok, result}
+
+      {:DOWN, ^monitor_ref, :process, ^pid, reason} ->
+        # Messages from one process are ordered, so a normal result sent just
+        # before exit is already in the mailbox. Keep this defensive check for
+        # runtimes where the monitor signal wins the receive race.
+        receive do
+          {^result_ref, result} -> {:ok, result}
+        after
+          0 -> {:exit, reason}
+        end
+
+      {:EXIT, ^pid, reason} ->
+        Process.demonitor(monitor_ref, [:flush])
+        {:exit, reason}
+
+      {:EXIT, ^handler, reason} ->
+        # Parent teardown (most importantly a script-level timeout) must cancel
+        # the callback before this worker follows the handler down.
+        Process.exit(pid, :kill)
+
+        receive do
+          {:DOWN, ^monitor_ref, :process, ^pid, _reason} -> :ok
+        end
+
+        exit(reason)
+    after
+      timeout ->
+        Process.exit(pid, :kill)
+
+        receive do
+          {:DOWN, ^monitor_ref, :process, ^pid, _reason} -> :ok
+        end
+
+        # Preserve a result that completed exactly at the deadline, matching
+        # the previous `Task.shutdown/2` implementation's race behavior.
+        receive do
+          {^result_ref, result} -> {:ok, result}
+        after
+          0 -> :timeout
+        end
     end
   end
 
@@ -928,13 +1001,7 @@ defmodule ExBashkit.Session do
     map = Map.new(builtins)
 
     Enum.each(map, fn {name, fun} ->
-      # A builtin name must be a single shell token — a name with whitespace
-      # could never be invoked from a script, so reject it loudly rather than
-      # register a dead entry.
-      unless is_binary(name) and Regex.match?(~r/^\S+$/, name) do
-        raise ArgumentError,
-              "builtin name must be a non-empty string with no whitespace, got: #{inspect(name)}"
-      end
+      validate_builtin_name!(name, "builtin name")
 
       unless is_function(fun, 1) do
         raise ArgumentError,
@@ -949,10 +1016,20 @@ defmodule ExBashkit.Session do
     raise ArgumentError, ":builtins must be a map of name => function, got: #{inspect(other)}"
   end
 
-  defp normalize_builtin_timeout(ms) when is_integer(ms) and ms > 0, do: ms
+  # The BEAM `receive ... after` primitive accepts at most 2^32-1 milliseconds.
+  # Letting a larger value through makes the callback worker raise
+  # `:timeout_value`; because the old worker chain was linked, that could take
+  # down the exec caller instead of merely rejecting a bad option.
+  @max_receive_timeout 4_294_967_295
+
+  defp normalize_builtin_timeout(ms)
+       when is_integer(ms) and ms > 0 and ms <= @max_receive_timeout,
+       do: ms
 
   defp normalize_builtin_timeout(other) do
-    raise ArgumentError, ":builtin_timeout_ms must be a positive integer, got: #{inspect(other)}"
+    raise ArgumentError,
+          ":builtin_timeout_ms must be an integer from 1 to #{@max_receive_timeout}, " <>
+            "got: #{inspect(other)}"
   end
 
   # --- virtual filesystem back-call handling --------------------------------
@@ -1029,7 +1106,8 @@ defmodule ExBashkit.Session do
   end
 
   defp normalize_fs_reply({:ok, %{type: type, size: size}}, :stat)
-       when type in [:file, :dir] and is_integer(size) and size >= 0,
+       when type in [:file, :dir] and is_integer(size) and size >= 0 and
+              size <= 18_446_744_073_709_551_615,
        do: {:ok_stat, type == :dir, size}
 
   # The reason string crosses the bridge too — truncate it so a backend returning a
@@ -1069,10 +1147,29 @@ defmodule ExBashkit.Session do
 
   defp truncate_reason(reason), do: inspect_bounded(reason)
 
-  defp fs_entry(name) when is_binary(name), do: {name, false}
-  defp fs_entry({name, :dir}), do: {to_string(name), true}
-  defp fs_entry({name, :file}), do: {to_string(name), false}
-  defp fs_entry({name, _other}), do: {to_string(name), false}
+  defp fs_entry(name) when is_binary(name), do: {validate_entry_name!(name), false}
+  defp fs_entry({name, :dir}) when is_binary(name), do: {validate_entry_name!(name), true}
+  defp fs_entry({name, :file}) when is_binary(name), do: {validate_entry_name!(name), false}
+
+  defp fs_entry(other) do
+    raise ArgumentError,
+          "invalid directory entry #{inspect_bounded(other)}; expected a name string or " <>
+            "{name, :file | :dir}"
+  end
+
+  # Mirror the native bridge's final line of defense at the earliest point a
+  # backend reply enters ExBashkit. Besides producing a useful backend error for
+  # invalid UTF-8 (which Rust `String` cannot decode), this keeps malformed names
+  # out of the wire term entirely. The Rust check remains intentionally: it is
+  # the safety boundary even if this normalizer changes later.
+  defp validate_entry_name!(name) do
+    if not String.valid?(name) or name == "" or name in [".", ".."] or
+         String.contains?(name, ["/", <<0>>]) do
+      raise ArgumentError, "invalid directory entry name #{inspect_bounded(name)}"
+    end
+
+    name
+  end
 
   defp fs_reason(reason) when is_atom(reason), do: Atom.to_string(reason)
   defp fs_reason(reason) when is_binary(reason), do: reason
@@ -1082,13 +1179,7 @@ defmodule ExBashkit.Session do
   # function, a module, or a {module, arg} tuple.
   defp normalize_virtual_fs(virtual_fs) when is_map(virtual_fs) or is_list(virtual_fs) do
     Map.new(virtual_fs, fn {path, spec} ->
-      path = to_string(path)
-
-      unless String.starts_with?(path, "/") and path != "/" do
-        raise ArgumentError,
-              ":virtual_fs mount path must be an absolute path other than \"/\", " <>
-                "got: #{inspect(path)}"
-      end
+      path = normalize_vfs_mount_path!(path, ":virtual_fs mount path")
 
       unless valid_fs_spec?(spec) do
         raise ArgumentError,
@@ -1192,12 +1283,7 @@ defmodule ExBashkit.Session do
   end
 
   defp normalize_mount({vfs, host, mode}) do
-    vfs = to_string(vfs)
-
-    unless String.starts_with?(vfs, "/") and vfs != "/" do
-      raise ArgumentError,
-            "mount vfs_path must be an absolute path other than \"/\", got: #{inspect(vfs)}"
-    end
+    vfs = normalize_vfs_mount_path!(vfs, "mount vfs_path")
 
     {vfs, to_string(host), to_string(mode)}
   end
@@ -1226,6 +1312,43 @@ defmodule ExBashkit.Session do
   # behave identically.
   defp normalize_env(env) when is_map(env) or is_list(env) do
     Enum.map(env, fn {key, value} -> {to_string(key), to_string(value)} end)
+  end
+
+  defp validate_builtin_name!(name, label) do
+    # A builtin name must be a valid UTF-8 shell token. Rustler decodes it as a
+    # Rust `String`, so invalid UTF-8/NUL must be rejected here instead of
+    # surfacing later as an opaque NIF `badarg`.
+    unless is_binary(name) and String.valid?(name) and not String.contains?(name, <<0>>) and
+             Regex.match?(~r/^\S+$/, name) do
+      raise ArgumentError,
+            "#{label} must be a non-empty valid UTF-8 string with no whitespace or NUL, " <>
+              "got: #{inspect(name)}"
+    end
+
+    name
+  end
+
+  defp normalize_vfs_mount_path!(path, label) do
+    path = to_string(path)
+
+    unless String.valid?(path) and not String.contains?(path, <<0>>) and
+             String.starts_with?(path, "/") and path != "/" do
+      raise ArgumentError,
+            "#{label} must be an absolute valid UTF-8 path other than \"/\", " <>
+              "got: #{inspect(path)}"
+    end
+
+    # A mount configured under a spelling such as `/a/../b`, `/a//b`, or `/a/`
+    # is normalized by bashkit's router but remains unnormalized as the Elixir
+    # backend-map key. That creates a session successfully while leaving the
+    # capability unreachable (or routed somewhere other than it appears).
+    unless Path.expand(path, "/") == path do
+      raise ArgumentError,
+            "#{label} must be normalized (no '.', '..', repeated separators, or trailing slash), " <>
+              "got: #{inspect(path)}"
+    end
+
+    path
   end
 
   defp normalize_string(nil), do: nil

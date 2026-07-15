@@ -92,6 +92,16 @@ defmodule ExBashkit.SessionMountTest do
       end
     end
 
+    test "a rejected mount targeting an existing default VFS directory still raises" do
+      # `/tmp` exists in every fresh bashkit VFS. The old post-build
+      # `fs.exists/1` probe mistook that base directory for the refused `/etc`
+      # mount and returned a session with the requested capability silently
+      # absent.
+      assert_raise ArgumentError, ~r/rejected/, fn ->
+        Session.new(mounts: [{"/tmp", "/etc", :read_only}])
+      end
+    end
+
     test "allowlisting a sensitive host path lets the mount through" do
       session =
         Session.new(mounts: [{"/etc_ro", "/etc", :read_only}], allowed_mount_paths: ["/etc"])
@@ -127,6 +137,12 @@ defmodule ExBashkit.SessionMountTest do
     test "a relative vfs path raises", %{root: root} do
       assert_raise ArgumentError, ~r/absolute/, fn ->
         Session.new(mounts: [{"data", root, :read_only}])
+      end
+    end
+
+    test "a non-normalized vfs path raises", %{root: root} do
+      assert_raise ArgumentError, ~r/must be normalized/, fn ->
+        Session.new(mounts: [{"/data/../other", root, :read_only}])
       end
     end
 

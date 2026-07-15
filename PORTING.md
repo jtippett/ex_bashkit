@@ -64,7 +64,8 @@ These cost real time on ExMonty. Honor them here.
 - Keep the NIF ABI version (`nif-2.15`) in `release.yml` in sync with rustler.
 
 ### Pin exact versions, never a moving ref
-- bashkit is on crates.io, so pin `bashkit = "=0.11.0"` (exact). Bump
+- bashkit is on crates.io, so pin an exact version (currently
+  `bashkit = "=0.13.0"`). Bump
   deliberately via the update procedure. (ExMonty had to pin a 40-char git hash
   because monty isn't published; we have it easier.)
 
@@ -168,7 +169,7 @@ Pause/resume *is* possible (phase 8), and serialization patterns from ExMonty's
 Each phase: implement the NIF(s), add the Elixir API + struct, write tests
 (`EXBASHKIT_BUILD=1 mix test`), update README + CHANGELOG, keep CI green.
 
-> **Status (Phases 1–9 shipped to `master`, CI green; 173 tests). Port complete.** Everything
+> **Status (Phases 1–9 shipped to `master`, CI green; 220 tests). Port complete.** Everything
 > below the line is built. The per-phase loop that's working: TDD (write the
 > failing test first) → implement → full gate (`mix test` + `mix format` +
 > `cargo fmt` + `cargo clippy -D warnings`) → dispatch the `superpowers:code-reviewer`
@@ -203,7 +204,8 @@ Done. `Session.new(files: %{...})` seeds the in-memory FS; `write_file/3` +
   config at session creation. This is the big simplification vs ExMonty's pull-based
   lease/checkout/drive design; don't reintroduce it. bashkit owns all
   escape/canonicalization/sensitive-path checks; we surface *refused* mounts (which
-  bashkit silently skips) via a post-build `fs.exists(vfs)` probe → `{:error, _}`.
+  bashkit silently skips) by mirroring its policy before build, with a post-build
+  `fs.exists(vfs)` probe retained for mount-point failures → `{:error, _}`.
 
 ### Phase 4 — Resource limits ✅
 Done. `Session.new(limits: [...])` decodes a map onto `ExecutionLimits` via
@@ -264,6 +266,10 @@ Hard-won specifics (don't re-derive):
   same-session deadlock; it doesn't permanently pin a thread.
 - Handler process is `spawn_link`ed then `unlink`+`:kill`ed on teardown (in an
   `after`) — orphan-safe if the caller dies, and the kill never reaches the caller.
+- Callback work runs in a linked+monitored child. Its exits are trapped by the
+  worker so even `Process.exit(self(), :kill)` becomes a bounded callback error;
+  the downward link remains so script-timeout handler teardown kills in-flight
+  work before it can land late side effects.
 
 ### Phase 6b — Dynamic Elixir-backed filesystem ✅
 Done. `Session.new(virtual_fs: %{"/api" => spec})` mounts an Elixir-backed
@@ -294,7 +300,8 @@ Hard-won specifics (don't re-derive):
 ### Phase 6c (later) — proxy rename/copy/symlink across virtual mounts; streaming.
 
 ### Phase 7 — Sandboxed `python` builtin ✅ (re-scoped 2026-06-20)
-- **Not** bashkit-native interpreters. Findings: the pinned `bashkit 0.11.0` on
+- **Not** bashkit-native interpreters. At the time of the Phase 7 decision, the
+  pinned `bashkit 0.11.0` on
   crates.io has **no `python` feature and no monty dep at all** (only the
   unreleased checkout does, via a git dep) — native python would force the whole
   bashkit dep onto a moving git source. `sqlite`/`typescript` **dropped** (user:

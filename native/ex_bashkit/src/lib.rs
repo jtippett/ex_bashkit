@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -224,28 +224,40 @@ impl Builtin for ElixirBuiltin {
         let handler = target.handler;
         let name = self.name.clone();
         let send_outcome = tokio::task::spawn_blocking(move || {
-            let mut owned = OwnedEnv::new();
-            owned.send_and_clear(&handler, |env_| {
-                let stdin_term = match OwnedBinary::new(stdin.len()) {
-                    Some(mut bin) => {
-                        bin.as_mut_slice().copy_from_slice(&stdin);
-                        bin.release(env_).encode(env_)
-                    }
-                    None => "".encode(env_),
+            // Allocate before sending. Falling back to an empty binary on
+            // allocation failure would silently change a builtin's stdin while
+            // still reporting a successful bridge send.
+            let stdin_binary = if stdin.is_empty() {
+                None
+            } else {
+                let Some(mut bin) = OwnedBinary::new(stdin.len()) else {
+                    return Err(());
                 };
-                rustler::types::tuple::make_tuple(
-                    env_,
-                    &[
-                        atoms::bashkit_call().encode(env_),
-                        req_id.encode(env_),
-                        name.encode(env_),
-                        args.encode(env_),
-                        stdin_term,
-                        env.encode(env_),
-                        cwd.encode(env_),
-                    ],
-                )
-            })
+                bin.as_mut_slice().copy_from_slice(&stdin);
+                Some(bin)
+            };
+
+            let mut owned = OwnedEnv::new();
+            owned
+                .send_and_clear(&handler, |env_| {
+                    let stdin_term = match stdin_binary {
+                        Some(bin) => bin.release(env_).encode(env_),
+                        None => "".encode(env_),
+                    };
+                    rustler::types::tuple::make_tuple(
+                        env_,
+                        &[
+                            atoms::bashkit_call().encode(env_),
+                            req_id.encode(env_),
+                            name.encode(env_),
+                            args.encode(env_),
+                            stdin_term,
+                            env.encode(env_),
+                            cwd.encode(env_),
+                        ],
+                    )
+                })
+                .map_err(|_| ())
         })
         .await;
 
@@ -424,31 +436,42 @@ impl ElixirFs {
         let mount = self.mount_path.clone();
         let path = path.to_string_lossy().into_owned();
         let send_outcome = tokio::task::spawn_blocking(move || {
-            let mut owned = OwnedEnv::new();
-            owned.send_and_clear(&handler, |env_| {
-                let op_atom = rustler::types::atom::Atom::from_str(env_, op)
-                    .expect("op atom")
-                    .encode(env_);
-                let data_term = match OwnedBinary::new(data.len()) {
-                    Some(mut bin) => {
-                        bin.as_mut_slice().copy_from_slice(&data);
-                        bin.release(env_).encode(env_)
-                    }
-                    None => "".encode(env_),
+            // As with builtin stdin, never turn an allocation failure into a
+            // successful write/append carrying different (empty) data.
+            let data_binary = if data.is_empty() {
+                None
+            } else {
+                let Some(mut bin) = OwnedBinary::new(data.len()) else {
+                    return Err(());
                 };
-                rustler::types::tuple::make_tuple(
-                    env_,
-                    &[
-                        atoms::bashkit_fs().encode(env_),
-                        req_id.encode(env_),
-                        mount.encode(env_),
-                        op_atom,
-                        path.encode(env_),
-                        data_term,
-                        recursive.encode(env_),
-                    ],
-                )
-            })
+                bin.as_mut_slice().copy_from_slice(&data);
+                Some(bin)
+            };
+
+            let mut owned = OwnedEnv::new();
+            owned
+                .send_and_clear(&handler, |env_| {
+                    let op_atom = rustler::types::atom::Atom::from_str(env_, op)
+                        .expect("op atom")
+                        .encode(env_);
+                    let data_term = match data_binary {
+                        Some(bin) => bin.release(env_).encode(env_),
+                        None => "".encode(env_),
+                    };
+                    rustler::types::tuple::make_tuple(
+                        env_,
+                        &[
+                            atoms::bashkit_fs().encode(env_),
+                            req_id.encode(env_),
+                            mount.encode(env_),
+                            op_atom,
+                            path.encode(env_),
+                            data_term,
+                            recursive.encode(env_),
+                        ],
+                    )
+                })
+                .map_err(|_| ())
         })
         .await;
 
@@ -850,6 +873,39 @@ fn mount_error<'a>(env: Env<'a>, vfs: &str, host: &str, reason: &str) -> Term<'a
     rustler::types::tuple::make_tuple(env, &[error, msg])
 }
 
+/// Encode a session-construction configuration error as `{:error, message}`.
+fn config_error<'a>(env: Env<'a>, message: &str) -> Term<'a> {
+    let error = rustler::types::atom::error().encode(env);
+    let msg = message.encode(env);
+    rustler::types::tuple::make_tuple(env, &[error, msg])
+}
+
+/// Keep ExBashkit's eager mount validation aligned with bashkit 0.13's
+/// `BashBuilder::is_sensitive_mount_path`. The builder deliberately warns and
+/// skips a refused mount instead of returning an error. ExBashkit promises
+/// construction-time errors, and an existence probe cannot detect a skipped
+/// mount when its VFS target is a default directory such as `/tmp`, so the
+/// wrapper must apply the same policy before calling `build()`.
+fn is_sensitive_mount_path(host_path: &Path) -> bool {
+    const SENSITIVE_PREFIXES: &[&str] = &[
+        "/proc", "/sys", "/dev", "/etc", "/boot", "/root", "/Users", "/home", "/run", "/var/run",
+        "/private",
+    ];
+    const SENSITIVE_COMPONENTS: &[&str] =
+        &[".ssh", ".aws", ".kube", ".docker", ".gnupg", ".gcloud"];
+
+    host_path == Path::new("/")
+        || SENSITIVE_PREFIXES
+            .iter()
+            .any(|prefix| host_path.starts_with(Path::new(prefix)))
+        || host_path.components().any(|component| {
+            let value = component.as_os_str();
+            SENSITIVE_COMPONENTS
+                .iter()
+                .any(|sensitive| value == *sensitive)
+        })
+}
+
 /// Build a persistent session from decoded builder options. Returns
 /// `{:ok, session}` or, if a host mount is misconfigured, `{:error, message}`.
 ///
@@ -876,6 +932,27 @@ fn session_new<'a>(
     virtual_fs_paths: Vec<String>,
 ) -> Term<'a> {
     let mut builder = bashkit::Bash::builder();
+
+    // bashkit canonicalizes an allowlist with `filter_map`, so a nonexistent or
+    // otherwise invalid entry is silently discarded. Validate it eagerly and
+    // retain the canonical paths for the per-mount policy check below.
+    let canonical_allowlist: Option<Vec<PathBuf>> = if allowed_mount_paths.is_empty() {
+        None
+    } else {
+        let mut canonical = Vec::with_capacity(allowed_mount_paths.len());
+        for allowed in &allowed_mount_paths {
+            match std::fs::canonicalize(allowed) {
+                Ok(path) => canonical.push(path),
+                Err(e) => {
+                    return config_error(
+                        env,
+                        &format!("allowed_mount_paths entry {allowed:?}: {e}"),
+                    );
+                }
+            }
+        }
+        Some(canonical)
+    };
 
     if let Some(limits) = decode_limits(env, limits) {
         builder = builder.limits(limits);
@@ -927,6 +1004,32 @@ fn session_new<'a>(
         // re-create the mount during `build()`.
         if let Err(e) = RealFs::new(host, real_mode) {
             return mount_error(env, vfs, host, &e.to_string());
+        }
+
+        // `RealFs::new` just proved this path canonicalizable and directory-like;
+        // retain a defensive error branch in case it changes between syscalls.
+        let canonical_host = match std::fs::canonicalize(host) {
+            Ok(path) => path,
+            Err(e) => return mount_error(env, vfs, host, &e.to_string()),
+        };
+
+        match &canonical_allowlist {
+            Some(allowlist)
+                if !allowlist
+                    .iter()
+                    .any(|allowed| canonical_host.starts_with(allowed)) =>
+            {
+                return mount_error(env, vfs, host, "host path is outside allowed_mount_paths");
+            }
+            None if is_sensitive_mount_path(&canonical_host) => {
+                return mount_error(
+                    env,
+                    vfs,
+                    host,
+                    "rejected sensitive host path; add a covering allowed_mount_paths entry",
+                );
+            }
+            _ => {}
         }
 
         builder = match real_mode {

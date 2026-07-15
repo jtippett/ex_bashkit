@@ -199,6 +199,16 @@ defmodule ExBashkit.SessionVfsDynamicTest do
       assert {:ok, %Result{stdout: "ok\n"}} = Session.exec(session, "echo ok")
     end
 
+    test "an uncatchable backend exit fails the op without killing the exec caller" do
+      session =
+        Session.new(virtual_fs: %{"/api" => fn _ -> Process.exit(self(), :kill) end})
+
+      assert {:ok, %Result{exit_code: code}} = Session.exec(session, "cat /api/x")
+      assert code != 0
+
+      assert {:ok, %Result{stdout: "ok\n"}} = Session.exec(session, "echo ok")
+    end
+
     test "a backend slower than :builtin_timeout_ms fails the op (session stays usable)" do
       slow =
         fn _ ->
@@ -248,9 +258,12 @@ defmodule ExBashkit.SessionVfsDynamicTest do
       # dropping the exec future; PendingFsCleanup must free the slot and the
       # session must stay usable. :builtin_timeout_ms is large so the script
       # timeout wins.
+      {:ok, counter} = Agent.start_link(fn -> 0 end)
+
       slow =
         fn _ ->
           Process.sleep(400)
+          Agent.update(counter, &(&1 + 1))
           {:ok, "late\n"}
         end
 
@@ -265,6 +278,9 @@ defmodule ExBashkit.SessionVfsDynamicTest do
       assert is_binary(message)
 
       assert {:ok, %Result{stdout: "ok\n"}} = Session.exec(session, "echo ok")
+
+      Process.sleep(450)
+      assert Agent.get(counter, & &1) == 0
     end
   end
 
@@ -301,6 +317,12 @@ defmodule ExBashkit.SessionVfsDynamicTest do
     test "a non-absolute mount path raises" do
       assert_raise ArgumentError, fn ->
         Session.new(virtual_fs: %{"rel" => fn _ -> {:ok, ""} end})
+      end
+    end
+
+    test "a non-normalized mount path raises instead of constructing an unreachable mount" do
+      assert_raise ArgumentError, ~r/must be normalized/, fn ->
+        Session.new(virtual_fs: %{"/api/../other" => fn _ -> {:ok, ""} end})
       end
     end
   end

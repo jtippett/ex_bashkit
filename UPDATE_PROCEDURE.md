@@ -3,7 +3,7 @@
 Run this periodically to pull upstream bashkit changes into ExBashkit.
 
 ExBashkit pins an **exact** bashkit version in `native/ex_bashkit/Cargo.toml`
-(`bashkit = "=0.11.0"`). Unlike monty (git-only), bashkit is published to
+(`bashkit = "=0.13.0"`). Unlike monty (git-only), bashkit is published to
 crates.io, so we track **released versions**, not a moving branch.
 
 **Track stable releases.** Target the latest `0.x.y` on crates.io unless the
@@ -32,8 +32,8 @@ bashkit keeps a CHANGELOG. If you have a local checkout at `../bashkit`:
 
 ```bash
 cd ../bashkit && git fetch --tags
-git log --oneline v0.11.0..v<NEW> -- crates/bashkit/
-git diff v0.11.0..v<NEW> -- crates/bashkit/src/lib.rs   # public re-exports
+git log --oneline v<CURRENT>..v<NEW> -- crates/bashkit/
+git diff v<CURRENT>..v<NEW> -- crates/bashkit/src/lib.rs   # public re-exports
 ```
 
 `crates/bashkit/src/lib.rs` is the public surface. Watch for changes to the
@@ -55,10 +55,11 @@ phases land (see `PORTING.md`).
 | `.fs(...)` builder, `MountableFs` (the layer `bash.fs()` returns) | implicit via `build()` | P3 |
 | `RealFs::new`, `RealFsMode`, builder `.mount_real_{readonly,readwrite}_at`, `.allowed_mount_paths` | `lib.rs` `session_new` mount loop | P3 |
 | `ExecutionLimits` + setters, builder `.limits()` | `lib.rs` `decode_limits` | P4 |
-| `NetworkAllowlist`, `http_client` feature | (planned) | P5 |
-| `Builtin` trait, `.builtin(...)` | (planned) | P6 |
-| `Snapshot`, `SnapshotOptions` | (planned) | P8 |
-| Feature flags: `realfs` (enabled), `http_client`/`sqlite`/`python`/… (off) | `Cargo.toml` | — |
+| `NetworkAllowlist`, builder `.network(...)`, `http_client` feature | `lib.rs` `decode_network` / `session_new` | P5 |
+| `Builtin` trait, `.builtin(...)`, execution extensions | `lib.rs` Elixir back-call bridge | P6 |
+| `FileSystem` / `FileSystemExt` custom mount implementations | `lib.rs` `ElixirFs` | P6b |
+| `SnapshotOptions`, snapshot/restore methods | `lib.rs` snapshot NIFs | P8 |
+| Feature flags: `realfs`, `jq`, and our default `http_client` mapping (enabled); `sqlite`/bashkit `python`/… (off) | `Cargo.toml` | — |
 
 When a bump breaks the build, the failure almost always points at one of these
 rows. `RealFsMode` (RO/RW only — no overlay) and the sensitive-path denylist
@@ -71,6 +72,15 @@ rows. `RealFsMode` (RO/RW only — no overlay) and the sensitive-path denylist
 Also check whether bashkit's **MSRV** rose (bump `rust-version` in Cargo.toml)
 and whether any **feature** we enable was renamed or split.
 
+Two security invariants are deliberately duplicated at the wrapper boundary and
+must be compared with the new bashkit source on every bump:
+
+- `is_sensitive_mount_path` in `native/ex_bashkit/src/lib.rs` mirrors
+  `BashBuilder::is_sensitive_mount_path`, because bashkit warns/skips refused
+  mounts while ExBashkit promises a construction error.
+- `validate_entry_name` protects recursive walkers from malformed external-FS
+  directory entries even if upstream traversal internals change.
+
 ---
 
 ## Phase 3: Update
@@ -80,16 +90,16 @@ and whether any **feature** we enable was renamed or split.
 In `native/ex_bashkit/Cargo.toml`:
 
 ```toml
-# bashkit = { version = "=0.11.0", default-features = false, features = ["realfs"] }
-bashkit = { path = "../../../bashkit/crates/bashkit", default-features = false, features = ["realfs"] }
+# bashkit = { version = "=0.13.0", default-features = false, features = ["realfs", "jq"] }
+bashkit = { path = "../../../bashkit/crates/bashkit", default-features = false, features = ["realfs", "jq"] }
 ```
 
 (Assumes a bashkit checkout at `../bashkit` relative to the project root.)
 
 > **Keep the feature set in sync.** We build `default-features = false` plus
-> `features = ["realfs"]` (host directory mounts; a no-dep feature gate). When a
-> network phase lands it will add `http_client`. Carry whatever features are
-> enabled through both the path-dep swap and the re-pin below.
+> dependency features `realfs` and `jq`. Network is enabled through *our crate's*
+> default `http_client = ["bashkit/http_client"]` feature mapping. Carry both the
+> dependency features and that mapping through the path-dep swap and re-pin.
 
 ### 3.2 Build and fix
 
@@ -111,6 +121,7 @@ Elixir), new feature names (`Cargo.toml`).
 ```bash
 EXBASHKIT_BUILD=1 mix test
 cd native/ex_bashkit && cargo fmt --check && cargo clippy -- -D warnings
+cargo audit
 ```
 
 ### 3.5 Update docs
@@ -125,7 +136,7 @@ CHANGELOG `[Unreleased]` entry from the **user's** perspective.
 ### 4.1 Re-pin to the exact released version
 
 ```toml
-bashkit = { version = "=0.<new>.0", default-features = false, features = ["realfs"] }
+bashkit = { version = "=0.<new>.0", default-features = false, features = ["realfs", "jq"] }
 # path dep commented out
 ```
 

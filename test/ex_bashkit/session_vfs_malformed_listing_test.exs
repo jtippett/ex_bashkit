@@ -57,7 +57,9 @@ defmodule ExBashkit.SessionVfsMalformedListingTest do
         {"dot", "."},
         {"dotdot", ".."},
         {"separator", "a/b"},
-        {"leading separator", "/etc"}
+        {"leading separator", "/etc"},
+        {"NUL", "a\0b"},
+        {"invalid UTF-8", <<255>>}
       ] do
     @tag timeout: 20_000
     test "a #{label} directory-entry name fails the walk as a bounded error, no crash" do
@@ -69,6 +71,21 @@ defmodule ExBashkit.SessionVfsMalformedListingTest do
       assert exit_code != 0
       assert stderr =~ "find:"
     end
+  end
+
+  test "an invalid directory-entry type fails the listing instead of becoming a file" do
+    backend = fn
+      %{op: :list} -> {:ok, [{"leaf", :symlink}]}
+      %{op: :stat} -> {:ok, %{type: :dir, size: 0}}
+    end
+
+    session = Session.new(virtual_fs: %{"/mnt" => backend})
+
+    assert {:ok, %Result{exit_code: exit_code, stderr: stderr}} =
+             Session.exec(session, "ls /mnt")
+
+    assert exit_code != 0
+    assert stderr =~ "ls:"
   end
 
   @tag timeout: 20_000

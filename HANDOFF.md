@@ -10,7 +10,7 @@ uncommitted scratch — keep it refreshed as you go.
 
 ## TL;DR — where things stand
 
-**Phases 1–9 are shipped to `master`, CI green, 173 tests — the staged port is
+**Phases 1–9 are shipped to `master`, CI green, 220 tests — the staged port is
 complete.** The library wraps bashkit faithfully (we vendor no execution logic —
 every semantic comes from bashkit; we only marshal data). Public surface:
 
@@ -66,7 +66,7 @@ our own release — regenerate + commit the checksum file before tagging).
 **Verify the build first thing:**
 ```bash
 cd /Users/james/Desktop/lib/ex_bashkit
-EXBASHKIT_BUILD=1 mix test          # 69 should pass
+EXBASHKIT_BUILD=1 mix test          # 220 should pass (12 doctests + 208 tests)
 ```
 (First build is slow — bashkit + tokio compile from scratch.)
 
@@ -87,10 +87,10 @@ Each phase also gets a README section, CHANGELOG entry, and an `examples/*.exs`.
 
 ## Key decisions & facts (don't re-litigate)
 
-- **Pin bashkit by exact crates.io semver** (`=0.11.0`) with
-  `default-features = false, features = ["realfs"]`. `realfs` (host mounts) is a
-  no-dep feature gate, compiled into the default build; mounting is default-deny
-  at runtime.
+- **Pin bashkit by exact crates.io semver** (currently `=0.13.0`) with
+  `default-features = false, features = ["realfs", "jq"]`; our own default
+  `http_client` feature maps to `bashkit/http_client`. Capabilities remain
+  default-deny at runtime.
 - **`exec` is async** → one shared multi-thread tokio runtime + `block_on` inside
   a **dirty** NIF. Never a runtime per call; never `block_on` in a non-dirty NIF.
 - **Resource = `ResourceArc<Mutex<Bash>>`** plus the FS handle from `bash.fs()`
@@ -100,8 +100,10 @@ Each phase also gets a README section, CHANGELOG entry, and an `examples/*.exs`.
 - **Host mounts: only `:read_only` / `:read_write`.** bashkit has no real-FS
   overlay mode → `:overlay` dropped. **No Mount resource / lease** — push model
   means mounts are builder config. bashkit silently skips refused mounts, so we
-  probe `fs.exists(vfs)` post-build and raise. Sensitive-path denylist includes
-  `/private` (→ macOS temp dirs need `:allowed_mount_paths`).
+  mirror its allowlist/sensitive-path policy before build, then retain the
+  post-build `fs.exists(vfs)` probe. Keep the mirrored policy synchronized on
+  dependency bumps. The denylist includes `/private` (→ macOS temp dirs need
+  `:allowed_mount_paths`).
 - **Limits** are session-level (builder), per-script. Output-byte caps deferred
   (they truncate, not error → need `%Result{}` fields → breaks doctests).
 - **Network: `:allow_net` (default-deny) + `:block_private_ips` (default true,
@@ -119,7 +121,9 @@ Each phase also gets a README section, CHANGELOG entry, and an `examples/*.exs`.
   `:timeout_ms` **drops** the exec future, so the table slot needs a
   `PendingCleanup` RAII guard or it leaks; (3) the reply NIF takes `i32`, so
   `%Result{exit_code}` is masked `band 0xFF` Elixir-side or it crashes the linked
-  caller. Handler pid travels as a bashkit `ExecutionExtensions` value.
+  caller. Callback work runs in linked+monitored children whose exits are trapped
+  upward but whose handler-teardown cancellation still propagates downward.
+  Handler pid travels as a bashkit `ExecutionExtensions` value.
 - **Virtual filesystems (`:virtual_fs`) reuse the builtin bridge** but FS trait
   methods get only `&Path` (no `Context`), so the per-exec handler pid travels via
   a shared `Arc<Mutex<Option<CallTarget>>>` cell on `SessionResource`, set/cleared

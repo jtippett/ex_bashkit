@@ -10,6 +10,27 @@
   `grep -r`) into unbounded recursion. Such names are now rejected at the bridge:
   the offending `list` fails as a bounded I/O error and the walk stops cleanly.
   (Legitimately deep trees remain bounded by bashkit's existing path-depth cap.)
+- Custom builtins and `:virtual_fs` backends that terminate via an uncatchable
+  process exit no longer take down the linked `Session.exec/2` caller. Callback
+  failures are isolated as command/I/O errors, while script-timeout teardown
+  still kills in-flight callback work so it cannot land late side effects.
+- `:builtin_timeout_ms` now rejects values above the BEAM receive ceiling at
+  session construction; such a value previously raised `:timeout_value` inside
+  the linked handler only when a callback ran.
+- Host mounts refused by bashkit are now policy-checked before build. A refused
+  mount targeting an existing default VFS directory (notably `/tmp`) previously
+  fooled the post-build existence check and returned a session with the requested
+  mount silently absent.
+- Virtual-FS listings now reject invalid UTF-8, invalid entry type tags, and all
+  no-progress/escaping names before crossing the NIF bridge (with the native
+  validation retained as defense in depth). Builtin names and VFS/host mount
+  points likewise reject values the native/router layers cannot represent or
+  route unambiguously.
+- An allocation failure while encoding builtin stdin or virtual-FS write data no
+  longer silently substitutes an empty binary and reports a successful bridge
+  send; the operation fails cleanly instead.
+- Updated transitive `anyhow` from 1.0.102 to 1.0.103, which fixes
+  RUSTSEC-2026-0190 (`Error::downcast_mut` borrow-rule unsoundness).
 
 ## 0.1.5 - 2026-07-15
 

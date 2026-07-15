@@ -106,6 +106,21 @@ defmodule ExBashkit.SessionBuiltinsTest do
       assert stderr =~ "weird"
     end
 
+    test "an uncatchable handler exit fails the command without killing the exec caller" do
+      session =
+        Session.new(
+          builtins: %{
+            "die" => fn _ -> Process.exit(self(), :kill) end,
+            "ok" => fn _ -> {:ok, "fine\n"} end
+          }
+        )
+
+      assert {:ok, %Result{exit_code: 1, stderr: stderr}} = Session.exec(session, "die")
+      assert stderr =~ "stopped"
+
+      assert {:ok, %Result{stdout: "fine\n", exit_code: 0}} = Session.exec(session, "ok")
+    end
+
     test "a handler exceeding :builtin_timeout_ms fails with exit 124" do
       session =
         Session.new(
@@ -156,6 +171,8 @@ defmodule ExBashkit.SessionBuiltinsTest do
       # pending-call slot must still be cleaned up (no leak) and the session must
       # stay usable. :builtin_timeout_ms is deliberately large so the script
       # timeout is the one that fires.
+      {:ok, counter} = Agent.start_link(fn -> 0 end)
+
       session =
         Session.new(
           limits: [timeout_ms: 50],
@@ -163,6 +180,7 @@ defmodule ExBashkit.SessionBuiltinsTest do
           builtins: %{
             "slow" => fn _ ->
               Process.sleep(400)
+              Agent.update(counter, &(&1 + 1))
               {:ok, "late\n"}
             end,
             "ok" => fn _ -> {:ok, "fine\n"} end
@@ -173,6 +191,11 @@ defmodule ExBashkit.SessionBuiltinsTest do
       assert is_binary(message)
 
       assert {:ok, %Result{stdout: "fine\n"}} = Session.exec(session, "ok")
+
+      # Handler teardown must propagate down to the callback process; otherwise
+      # it would survive the script timeout and land this side effect later.
+      Process.sleep(450)
+      assert Agent.get(counter, & &1) == 0
     end
   end
 
@@ -253,6 +276,18 @@ defmodule ExBashkit.SessionBuiltinsTest do
     test "a non-positive :builtin_timeout_ms raises" do
       assert_raise ArgumentError, ~r/builtin_timeout_ms/, fn ->
         Session.new(builtins: %{"x" => fn _ -> {:ok, ""} end}, builtin_timeout_ms: 0)
+      end
+    end
+
+    test "a :builtin_timeout_ms above the BEAM receive ceiling raises at construction" do
+      assert_raise ArgumentError, ~r/builtin_timeout_ms/, fn ->
+        Session.new(builtin_timeout_ms: 4_294_967_296)
+      end
+    end
+
+    test "an invalid UTF-8 builtin name raises at construction instead of a NIF badarg" do
+      assert_raise ArgumentError, ~r/valid UTF-8/, fn ->
+        Session.new(builtins: %{<<255>> => fn _ -> {:ok, ""} end})
       end
     end
   end

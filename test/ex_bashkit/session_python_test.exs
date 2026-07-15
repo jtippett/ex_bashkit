@@ -260,6 +260,12 @@ if Code.ensure_loaded?(ExMonty) do
           Session.new(python: true, builtins: %{"python" => fn _ -> {:ok, ""} end})
         end
       end
+
+      test "an invalid Python builtin name raises before entering the NIF" do
+        assert_raise ArgumentError, ~r/python builtin name/, fn ->
+          Session.new(python: [name: <<255>>])
+        end
+      end
     end
   end
 end
