@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## 0.1.6 - 2026-07-15
+
 ### Fixed
 
 - A `:virtual_fs` backend returning a directory-entry name that resolves back
