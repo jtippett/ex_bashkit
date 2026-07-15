@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- A `:virtual_fs` backend returning a directory-entry name that resolves back
+  onto the directory being listed — an empty string, `.`, `..`, or a name
+  containing a path separator — could send a recursive builtin (`find`,
+  `grep -r`) into unbounded recursion. Such names are now rejected at the bridge:
+  the offending `list` fails as a bounded I/O error and the walk stops cleanly.
+  (Legitimately deep trees remain bounded by bashkit's existing path-depth cap.)
+
 ## 0.1.5 - 2026-07-15
 
 ### Changed

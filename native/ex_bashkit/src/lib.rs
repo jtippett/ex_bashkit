@@ -360,6 +360,35 @@ fn fs_bridge_error(msg: &str) -> bashkit::Error {
     std::io::Error::other(msg.to_string()).into()
 }
 
+/// Reject a directory-entry name that a recursive walker (`find`, `grep -r`)
+/// would resolve back onto — or off — the directory it just listed.
+///
+/// Walkers descend by joining each listed name onto the parent path
+/// (`parent.join(name)`) and recursing. bashkit's `find` has no default
+/// max-depth, and driving a chain of nested async futures nests a real native
+/// stack frame per level — so a name that fails to move *strictly one component
+/// deeper* lets recursion run unbounded until the host BEAM stack overflows
+/// (SIGBUS), a whole-node crash rather than a contained sandbox failure:
+///
+/// - `""` → `parent.join("") == parent`: re-enters the same directory forever.
+/// - `"."` → same directory; `".."` → an ancestor: neither makes net progress.
+/// - a name containing `/` (including an absolute one like `/etc`, which
+///   *replaces* the base under `Path::join`) is not a single path component and
+///   can escape the listed directory entirely.
+///
+/// Growth-by-more-than-one and legitimately deep trees stay bounded by bashkit's
+/// own path-resolution depth cap, so name validation is the exact complement
+/// that closes the no-progress cases. A malformed listing is a backend bug: fail
+/// the whole op loudly rather than feed a walker-poisoning entry to bashkit.
+fn validate_entry_name(name: &str) -> bashkit::Result<()> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
+        return Err(fs_bridge_error(&format!(
+            "virtual filesystem: invalid directory entry name {name:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// A `FileSystem` mounted at a vfs path whose operations are serviced by Elixir.
 struct ElixirFs {
     /// The vfs mount point (e.g. `/api`); identifies the handler's backend.
@@ -522,20 +551,23 @@ impl FileSystem for ElixirFs {
 
     async fn read_dir(&self, path: &Path) -> bashkit::Result<Vec<bashkit::DirEntry>> {
         match self.call("list", path, Vec::new(), false).await? {
-            FsReply::List(entries) => Ok(entries
+            FsReply::List(entries) => entries
                 .into_iter()
-                .map(|(name, is_dir)| bashkit::DirEntry {
-                    name,
-                    metadata: bashkit::Metadata {
-                        file_type: if is_dir {
-                            bashkit::FileType::Directory
-                        } else {
-                            bashkit::FileType::File
+                .map(|(name, is_dir)| {
+                    validate_entry_name(&name)?;
+                    Ok(bashkit::DirEntry {
+                        name,
+                        metadata: bashkit::Metadata {
+                            file_type: if is_dir {
+                                bashkit::FileType::Directory
+                            } else {
+                                bashkit::FileType::File
+                            },
+                            ..Default::default()
                         },
-                        ..Default::default()
-                    },
+                    })
                 })
-                .collect()),
+                .collect(),
             FsReply::Error(reason) => Err(map_fs_error(&reason)),
             _ => Err(fs_bridge_error(
                 "virtual filesystem: unexpected reply for list",
