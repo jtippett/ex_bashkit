@@ -113,9 +113,9 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "bashkit"
-version = "0.11.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ce8b30b60ffebbc80a5555ff6b545719e52e0548ed43d1ab330f14c09316d7a"
+checksum = "5250bc36a0b27983b9eaebfe743bacb7dcb090546bd0106a375803545bafe5d5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -126,7 +126,6 @@ dependencies = [
  "clap",
  "fancy-regex",
  "flate2",
- "futures-core",
  "futures-util",
  "getrandom 0.4.3",
  "hmac",
@@ -145,9 +144,9 @@ dependencies = [
  "sha2",
  "thiserror 2.0.18",
  "tokio",
- "tower",
  "unit-prefix",
  "url",
+ "web-time",
 ]
 
 [[package]]
@@ -907,7 +906,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1913,6 +1912,16 @@ name = "web-sys"
 version = "0.3.72"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6488b90108c040df0fe62fa815cbdee25124641df01814dd7282749234c6112"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "web-time"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",

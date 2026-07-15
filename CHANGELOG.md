@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Updated the bundled bashkit interpreter to **0.13.0** (from 0.11.0). No changes
+  to the ExBashkit API. Notable interpreter improvements scripts pick up:
+  - `xargs -P/--max-procs` runs command batches concurrently, with
+    `--process-slot-var` exposing the slot index to each child.
+  - `ls -d/--directory` lists directories themselves instead of their contents,
+    and long-format `ls` renders actual UTC calendar dates.
+  - `$HOME` is now a writable directory (the VFS provisions the user home).
+  - Glob `*` matching is now linear-time, closing an exponential-blowup DoS on
+    adversarial patterns.
+  - A batch of interpreter correctness and security fixes (getopts cursor reset
+    across shell boundaries, `read` whitespace handling, snapshot restore
+    validation, and more).
+
 ## 0.1.4 - 2026-06-26
 
 ### Added

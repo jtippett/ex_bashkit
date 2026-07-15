@@ -51,7 +51,7 @@ rustler = "0.38"
 # the LLM-agent use case; it's pure computation (no I/O/escape surface), so it
 # needs no runtime gate. Baked into the shipped NIF; not cfg-gated in our code
 # because we never reference jq from Rust (it's purely a bashkit builtin).
-bashkit = { version = "=0.11.0", default-features = false, features = ["realfs", "jq"] }
+bashkit = { version = "=0.13.0", default-features = false, features = ["realfs", "jq"] }
 # For local iteration against a checkout, comment the line above and use:
 # bashkit = { path = "../../../bashkit/crates/bashkit", default-features = false, features = ["realfs", "jq"] }
 
