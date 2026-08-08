@@ -147,22 +147,26 @@ cd ../.. && mix clean && EXBASHKIT_BUILD=1 mix test
 
 ### 4.2 Cut the ExBashkit release
 
-This is the precompiled-NIF dance — **order matters**:
+`release.yml` automates the precompiled-NIF dance:
 
 1. Decide the ExBashkit version (semver against *our* API, not bashkit's). Bump
    `@version` in `mix.exs`; finalize the CHANGELOG section.
-2. Commit on `master`; open a PR; merge when CI is green.
+2. Commit on `master` once the full gate is green.
 3. Tag and push: `git tag -a vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z`.
    This triggers `release.yml`, which builds NIFs for all 4 targets and creates
    the GitHub release with the `.tar.gz` artifacts.
-4. **Wait for that workflow to finish.** Confirm the release has 4 artifacts.
-5. Regenerate checksums (note `EXBASHKIT_BUILD=1` to dodge the compile
-   chicken-and-egg):
-   ```bash
-   EXBASHKIT_BUILD=1 mix rustler_precompiled.download ExBashkit.Native --all --print
-   ```
-6. Commit the updated `checksum-Elixir.ExBashkit.Native.exs` and push.
-7. `mix hex.publish` — the irreversible outward step (needs your Hex auth).
+4. The workflow then **pauses at the `hex` environment gate**. Confirm the
+   release has 4 artifacts, then approve the "Publish to Hex" deployment in
+   the Actions UI — the irreversible outward step, and deliberately a human's.
+5. On approval the workflow regenerates
+   `checksum-Elixir.ExBashkit.Native.exs` from the released artifacts (the
+   canonical `mix rustler_precompiled.download --all` path, so packaged
+   checksums always match what fetch-time expects), publishes the package to
+   Hex, and pushes docs to HexDocs. No manual checksum commit, no re-tag.
+
+The repo's checked-in checksum file is not updated per release; only the Hex
+package carries the fresh one. Anyone consuming ExBashkit as a **git**
+dependency must build locally with `EXBASHKIT_BUILD=1`.
 
 ### 4.3 Commit message shape
 
