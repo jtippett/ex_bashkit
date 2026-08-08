@@ -631,6 +631,10 @@ defmodule ExBashkit.Session do
       resumed = ExBashkit.Session.new(builtins: same, virtual_fs: same, limits: same)
       {:ok, resumed} = ExBashkit.Session.restore(resumed, bytes)
 
+  That flow is enforced: a snapshot records the capabilities its session had,
+  and restoring into a session that lacks any of them (say, a missing custom
+  builtin) returns `{:error, message}` naming the mismatch.
+
   bashkit validates the whole snapshot before mutating anything, so a malformed,
   tampered, or wrong-key snapshot returns `{:error, _}` and leaves the session
   untouched and usable. Keying is symmetric and all-or-nothing: bytes taken with

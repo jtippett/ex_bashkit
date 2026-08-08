@@ -244,5 +244,21 @@ defmodule ExBashkit.SessionSnapshotTest do
       assert {:ok, %Result{stdout: "hi\n"}} = Session.exec(b, "hi")
       assert {:ok, %Result{stdout: "v:thing\n"}} = Session.exec(b, "cat /api/thing")
     end
+
+    test "restore into a session missing a snapshotted builtin is rejected" do
+      # Since bashkit 0.16, a snapshot records the capabilities the session had,
+      # and restore refuses a target that lacks any of them — enforcing the
+      # documented contract that resume rebuilds a session with the SAME
+      # capabilities. The failed restore leaves the target session usable.
+      a = Session.new(builtins: %{"hi" => fn _ -> {:ok, "hi\n"} end})
+      assert {:ok, %Result{exit_code: 0}} = Session.exec(a, "x=1")
+      {:ok, bytes} = Session.snapshot(a)
+
+      b = Session.new()
+      assert {:error, message} = Session.restore(b, bytes)
+      assert message =~ "missing builtins: hi"
+
+      assert {:ok, %Result{stdout: "ok\n"}} = Session.exec(b, "echo ok")
+    end
   end
 end

@@ -2,6 +2,40 @@
 
 ## [Unreleased]
 
+## 0.1.8 - 2026-08-08
+
+### Added
+
+- Scripts pick up bashkit's new `yq` builtin, bzip2 archive/compression support,
+  and truthful `time` reporting.
+
+### Changed
+
+- Updated the bundled bashkit interpreter from **0.13.0** to **0.16.0**. This
+  brings byte-native internal shell streams, stricter unknown-option and parser
+  handling, intermediate-component glob expansion, request-wide execution
+  budgets and capability cleanup, filesystem hardening, and v2 snapshots with
+  capability validation. ExBashkit's Elixir API is unchanged.
+- bashkit's narrow, nonstandard `yaml` builtin was removed upstream; use the new
+  jq-compatible `yq` builtin instead.
+- **Snapshot format:** `Session.snapshot/2` now writes bashkit's v2
+  content-addressed container. Snapshots from earlier ExBashkit versions still
+  restore, but snapshots written by 0.1.8 cannot be restored by 0.1.7 or
+  earlier — upgrade readers before writers if you persist snapshots across
+  deployments.
+- **Snapshot restore validates capabilities:** `Session.restore/3` now rejects
+  a snapshot whose recorded capabilities (custom builtins, features, mounts)
+  the target session lacks, with a descriptive error, instead of silently
+  restoring into a session that cannot replay them. Rebuild the target with the
+  same options as the snapshotted session — the contract the docs always
+  required. The failed restore leaves the target session untouched and usable.
+
+### Fixed
+
+- Stderr from an Elixir-defined builtin is no longer swallowed when that
+  builtin is a non-final pipeline stage. The pipeline still reports the last
+  stage's exit code, matching Bash semantics.
+
 ## 0.1.7 - 2026-07-15
 
 ## 0.1.6 - 2026-07-15

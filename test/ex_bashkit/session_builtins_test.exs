@@ -45,6 +45,23 @@ defmodule ExBashkit.SessionBuiltinsTest do
       assert {:ok, %Result{stderr: "boom\n", exit_code: 1}} = Session.exec(session, "nope")
     end
 
+    test "stderr from a failing builtin survives non-final pipeline stages" do
+      session = Session.new(builtins: %{"boom" => fn _ -> {:error, "boom failed\n"} end})
+
+      assert {:ok, %Result{stderr: "boom failed\n", exit_code: 1}} =
+               Session.exec(session, "boom")
+
+      assert {:ok, %Result{stderr: stderr, exit_code: 0}} =
+               Session.exec(session, "boom | head -5")
+
+      assert stderr =~ "boom failed"
+
+      assert {:ok, %Result{stderr: stderr}} =
+               Session.exec(session, "boom | jq -r '.x' | head -5")
+
+      assert stderr =~ "boom failed"
+    end
+
     test "a %Result{} gives full control over stdout/stderr/exit_code" do
       session =
         Session.new(

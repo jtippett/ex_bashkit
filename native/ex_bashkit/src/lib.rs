@@ -152,14 +152,13 @@ impl Drop for FsTargetGuard {
     }
 }
 
-/// Build an `ExecResult` from raw stdout/stderr bytes and an exit code. Sets
-/// `stdout_bytes` so binary output round-trips exactly, and a lossy `stdout`
-/// string for the text path (pipes, captures).
+/// Build an `ExecResult` from raw stdout/stderr bytes and an exit code.
+/// `StreamData` keeps those bytes exact through pipelines and captures; text
+/// decoding remains an explicit concern at the outer ExBashkit result boundary.
 fn builtin_exec_result(stdout: Vec<u8>, stderr: Vec<u8>, exit_code: i32) -> ExecResult {
     ExecResult {
-        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-        stdout_bytes: Some(stdout),
-        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        stdout: stdout.into(),
+        stderr: stderr.into(),
         exit_code,
         ..Default::default()
     }
@@ -180,7 +179,10 @@ struct ElixirBuiltin {
 #[async_trait]
 impl Builtin for ElixirBuiltin {
     async fn execute(&self, ctx: BuiltinContext<'_>) -> bashkit::Result<ExecResult> {
-        let Some(target) = ctx.execution_extension::<CallTarget>().copied() else {
+        let Some(target) = ctx
+            .execution_extension::<CallTarget>()
+            .and_then(|target| target.try_with(|target| *target).ok())
+        else {
             // No handler wired for this exec — shouldn't happen (we always set
             // one), but fail the command rather than panic.
             return Ok(builtin_error_result(
@@ -715,17 +717,17 @@ fn encode_exec_result<'a>(env: Env<'a>, result: bashkit::Result<bashkit::ExecRes
     match result {
         Ok(r) => {
             let ok = rustler::types::atom::ok().encode(env);
-            // `r.stdout` is a (lossy) String. bashkit only carries exact
-            // `stdout_bytes` on a *builtin's own* ExecResult, not on the script's
-            // top-level result — its interpreter re-buffers output through a
-            // String — so reading `stdout_bytes` here is always `None` and binary
-            // builtin output is unavoidably lossy at the result boundary. That's a
-            // bashkit limitation, not ours; we don't paper over it.
+            // Bashkit now preserves exact stream bytes internally. ExBashkit's
+            // public Result fields remain String.t(), so retain the bridge's
+            // established lossy UTF-8 conversion rather than changing its API
+            // semantics as part of this dependency bump.
+            let stdout = r.stdout.text_lossy();
+            let stderr = r.stderr.text_lossy();
             let payload = rustler::types::tuple::make_tuple(
                 env,
                 &[
-                    r.stdout.encode(env),
-                    r.stderr.encode(env),
+                    stdout.as_ref().encode(env),
+                    stderr.as_ref().encode(env),
                     r.exit_code.encode(env),
                 ],
             );
@@ -880,7 +882,7 @@ fn config_error<'a>(env: Env<'a>, message: &str) -> Term<'a> {
     rustler::types::tuple::make_tuple(env, &[error, msg])
 }
 
-/// Keep ExBashkit's eager mount validation aligned with bashkit 0.13's
+/// Keep ExBashkit's eager mount validation aligned with bashkit 0.16's
 /// `BashBuilder::is_sensitive_mount_path`. The builder deliberately warns and
 /// skips a refused mount instead of returning an error. ExBashkit promises
 /// construction-time errors, and an existence probe cannot detect a skipped
@@ -894,7 +896,7 @@ fn is_sensitive_mount_path(host_path: &Path) -> bool {
     const SENSITIVE_COMPONENTS: &[&str] =
         &[".ssh", ".aws", ".kube", ".docker", ".gnupg", ".gcloud"];
 
-    host_path == Path::new("/")
+    host_path.parent().is_none()
         || SENSITIVE_PREFIXES
             .iter()
             .any(|prefix| host_path.starts_with(Path::new(prefix)))
@@ -1002,7 +1004,7 @@ fn session_new<'a>(
         // Validate the host path with bashkit's own RealFs (canonicalize + must
         // be an existing directory). On success we discard it and let the builder
         // re-create the mount during `build()`.
-        if let Err(e) = RealFs::new(host, real_mode) {
+        if let Err(e) = runtime().block_on(RealFs::open(host, real_mode)) {
             return mount_error(env, vfs, host, &e.to_string());
         }
 
