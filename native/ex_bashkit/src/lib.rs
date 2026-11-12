@@ -421,6 +421,16 @@ impl ElixirFs {
         data: Vec<u8>,
         recursive: bool,
     ) -> bashkit::Result<FsReply> {
+        // bashkit's bulk `FileSystem::walk` hook (0.20.3+) reads a mounted
+        // backend directly, below the `MountableFs` layer that used to apply
+        // the path depth/length caps. A backend that lists itself forever
+        // would then be walked ~10k levels deep, and recursive consumers
+        // (`du`) overflow the native stack and take the VM down. Re-apply
+        // bashkit's default path limits here, before any back-call.
+        bashkit::FsLimits::new()
+            .validate_path(path)
+            .map_err(|e| fs_bridge_error(&e.to_string()))?;
+
         let target = (*self.target.lock().unwrap_or_else(|p| p.into_inner()))
             .ok_or_else(|| fs_bridge_error("no active execution for this virtual filesystem"))?;
 
@@ -882,31 +892,13 @@ fn config_error<'a>(env: Env<'a>, message: &str) -> Term<'a> {
     rustler::types::tuple::make_tuple(env, &[error, msg])
 }
 
-/// Keep ExBashkit's eager mount validation aligned with bashkit 0.16's
-/// `BashBuilder::is_sensitive_mount_path`. The builder deliberately warns and
-/// skips a refused mount instead of returning an error. ExBashkit promises
-/// construction-time errors, and an existence probe cannot detect a skipped
-/// mount when its VFS target is a default directory such as `/tmp`, so the
-/// wrapper must apply the same policy before calling `build()`.
-fn is_sensitive_mount_path(host_path: &Path) -> bool {
-    const SENSITIVE_PREFIXES: &[&str] = &[
-        "/proc", "/sys", "/dev", "/etc", "/boot", "/root", "/Users", "/home", "/run", "/var/run",
-        "/private",
-    ];
-    const SENSITIVE_COMPONENTS: &[&str] =
-        &[".ssh", ".aws", ".kube", ".docker", ".gnupg", ".gcloud"];
-
-    host_path.parent().is_none()
-        || SENSITIVE_PREFIXES
-            .iter()
-            .any(|prefix| host_path.starts_with(Path::new(prefix)))
-        || host_path.components().any(|component| {
-            let value = component.as_os_str();
-            SENSITIVE_COMPONENTS
-                .iter()
-                .any(|sensitive| value == *sensitive)
-        })
-}
+/// ExBashkit's eager mount validation uses bashkit's own public denylist
+/// (`bashkit::is_sensitive_mount_path`, exported since 0.18). The builder
+/// deliberately warns and skips a refused mount instead of returning an error.
+/// ExBashkit promises construction-time errors, and an existence probe cannot
+/// detect a skipped mount when its VFS target is a default directory such as
+/// `/tmp`, so the wrapper must apply the same policy before calling `build()`.
+use bashkit::is_sensitive_mount_path;
 
 /// Build a persistent session from decoded builder options. Returns
 /// `{:ok, session}` or, if a host mount is misconfigured, `{:error, message}`.

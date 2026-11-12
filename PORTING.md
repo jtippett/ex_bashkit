@@ -65,7 +65,7 @@ These cost real time on ExMonty. Honor them here.
 
 ### Pin exact versions, never a moving ref
 - bashkit is on crates.io, so pin an exact version (currently
-  `bashkit = "=0.13.0"`). Bump
+  `bashkit = "=0.21.0"`). Bump
   deliberately via the update procedure. (ExMonty had to pin a 40-char git hash
   because monty isn't published; we have it easier.)
 

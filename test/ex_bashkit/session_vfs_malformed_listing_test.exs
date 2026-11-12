@@ -98,6 +98,25 @@ defmodule ExBashkit.SessionVfsMalformedListingTest do
     assert stderr =~ "too deep"
   end
 
+  # bashkit 0.20.3's bulk directory walk reads a mounted backend below the layer
+  # that enforces the path depth cap; unguarded, `du` recursed ~10k levels and
+  # overflowed the native stack, killing the VM. The bridge re-applies the cap.
+  @tag timeout: 20_000
+  test "du over unbounded directory depth fails cleanly instead of crashing the VM" do
+    session = Session.new(virtual_fs: %{"/mnt" => {InfiniteDepthFs, nil}})
+
+    message =
+      case Session.exec(session, "du /mnt") do
+        {:ok, %Result{stderr: stderr}} -> stderr
+        {:error, message} -> message
+      end
+
+    assert message =~ "too deep"
+
+    # The session (and the VM) are still usable afterwards.
+    assert {:ok, %Result{stdout: "ok\n", exit_code: 0}} = Session.exec(session, "echo ok")
+  end
+
   test "a well-formed nested listing still traverses (validation does not over-reject)" do
     session = Session.new(virtual_fs: %{"/mnt" => {GoodFs, nil}})
 

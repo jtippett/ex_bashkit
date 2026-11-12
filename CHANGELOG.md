@@ -2,6 +2,50 @@
 
 ## [Unreleased]
 
+## 0.1.9 - 2026-11-12
+
+### Added
+
+- Scripts pick up five upstream bashkit minor versions of shell and utility
+  compatibility: concurrent pipelines and background jobs, symlink traversal,
+  a GNU-aligned `sed` (new commands, range addresses, case conversion, atomic
+  `-i`), GNU-oriented `awk`/coreutils behaviour, `du -a`, `find -size`, and
+  more everyday commands.
+- The sandbox now starts with a synthetic root filesystem (`/bin`, `/etc`,
+  `/home`, `/usr`, …) including stand-in files such as `/etc/passwd`, so
+  scripts that expect a conventional layout work. Nothing in it comes from the
+  host.
+
+### Changed
+
+- Updated the bundled bashkit interpreter from **0.16.0** to **0.21.0**.
+  ExBashkit's Elixir API is unchanged, and snapshots written by 0.1.8 restore
+  under 0.1.9.
+- **`/etc/passwd` and similar paths now exist** in a fresh sandbox (see above).
+  Code that used a missing `/etc/...` file as a "this is sandboxed" probe will
+  see exit code 0 instead of a failure.
+- `curl`/`wget` output is binary-safe through redirections and pipelines, and
+  `cp -r source/. destination` copies directory contents without adding an
+  extra directory level.
+- Refreshed the NIF's Rust dependencies, clearing published advisories in
+  rustls, rustls-webpki, the bundled root certificates, and tokio.
+
+### Security
+
+- Picks up upstream sandbox hardening: bounded `eval`/`compgen`/sourced-script
+  recursion, bounded parsing of nested substitutions and archive listings,
+  setuid bits dropped on host mounts, normalized host-mount path mapping,
+  refused backend symlink reads, and wider memory/output accounting.
+
+### Fixed
+
+- A `:virtual_fs` backend that lists itself without end (every directory
+  containing another directory) can no longer crash the BEAM. bashkit 0.20.3's
+  bulk directory walk reads a mounted backend below the layer that enforces the
+  100-level path depth cap, and `du` then recursed until the native stack
+  overflowed. The bridge now applies bashkit's path depth and length limits
+  before every backend call, so such a walk fails with "path too deep".
+
 ## 0.1.8 - 2026-08-08
 
 ### Added

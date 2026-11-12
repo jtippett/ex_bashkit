@@ -42,7 +42,7 @@ iex> ExBashkit.exec("for i in 1 2 3; do echo $((i * i)); done")
 
 # A non-zero exit is still {:ok, ...} — the script ran and chose to fail,
 # exactly like a real shell.
-iex> ExBashkit.exec("test -f /etc/passwd")
+iex> ExBashkit.exec("test -f /no/such/file")
 {:ok, %ExBashkit.Result{exit_code: 1}}
 ```
 
@@ -102,7 +102,10 @@ ExBashkit.Session.read_file(session, "/out.txt")
 - `ExBashkit.Session.read_file(session, path)` returns `{:ok, binary}` — including
   files a script wrote — round-tripping arbitrary (even non-UTF-8) bytes.
 
-By default the filesystem is fully virtual — no host path is reachable.
+By default the filesystem is fully virtual — no host path is reachable. The
+sandbox starts with a small synthetic root (`/bin`, `/etc`, `/home`, `/tmp`,
+`/usr`, …) holding stand-in system files such as `/etc/passwd`, so scripts that
+expect a conventional layout keep working. None of it comes from the host.
 
 ## Host mounts
 

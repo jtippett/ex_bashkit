@@ -3,7 +3,7 @@
 Run this periodically to pull upstream bashkit changes into ExBashkit.
 
 ExBashkit pins an **exact** bashkit version in `native/ex_bashkit/Cargo.toml`
-(`bashkit = "=0.13.0"`). Unlike monty (git-only), bashkit is published to
+(`bashkit = "=0.21.0"`). Unlike monty (git-only), bashkit is published to
 crates.io, so we track **released versions**, not a moving branch.
 
 **Track stable releases.** Target the latest `0.x.y` on crates.io unless the
@@ -59,7 +59,9 @@ phases land (see `PORTING.md`).
 | `Builtin` trait, `.builtin(...)`, execution extensions | `lib.rs` Elixir back-call bridge | P6 |
 | `FileSystem` / `FileSystemExt` custom mount implementations | `lib.rs` `ElixirFs` | P6b |
 | `SnapshotOptions`, snapshot/restore methods | `lib.rs` snapshot NIFs | P8 |
-| Feature flags: `realfs`, `jq`, and our default `http_client` mapping (enabled); `sqlite`/bashkit `python`/… (off) | `Cargo.toml` | — |
+| `bashkit::is_sensitive_mount_path` (public since 0.18) | `lib.rs` `session_new` mount loop | 0.21 |
+| `FsLimits::new().validate_path` | `lib.rs` `ElixirFs::call` path guard | 0.21 |
+| Feature flags: `realfs`, `jq`, `tzdata`, and our default `http_client` mapping (`bashkit/http_client` + `bashkit/ring`) (enabled); `sqlite`/bashkit `python`/… (off) | `Cargo.toml` | — |
 
 When a bump breaks the build, the failure almost always points at one of these
 rows. `RealFsMode` (RO/RW only — no overlay) and the sensitive-path denylist
@@ -72,14 +74,27 @@ rows. `RealFsMode` (RO/RW only — no overlay) and the sensitive-path denylist
 Also check whether bashkit's **MSRV** rose (bump `rust-version` in Cargo.toml)
 and whether any **feature** we enable was renamed or split.
 
-Two security invariants are deliberately duplicated at the wrapper boundary and
-must be compared with the new bashkit source on every bump:
+Three security invariants live at the wrapper boundary and must be re-checked
+against the new bashkit source on every bump:
 
-- `is_sensitive_mount_path` in `native/ex_bashkit/src/lib.rs` mirrors
-  `BashBuilder::is_sensitive_mount_path`, because bashkit warns/skips refused
-  mounts while ExBashkit promises a construction error.
-- `validate_entry_name` protects recursive walkers from malformed external-FS
-  directory entries even if upstream traversal internals change.
+- **Sensitive mount paths.** `session_new` refuses a sensitive host mount with
+  a construction error, because bashkit only warns and skips it. Since 0.21 we
+  call upstream's public `bashkit::is_sensitive_mount_path` instead of keeping
+  a copy, so there is nothing to diff, but confirm the function is still
+  exported and still the one `apply_real_mounts` consults.
+- **`validate_entry_name`** protects recursive walkers from malformed
+  external-FS directory entries even if upstream traversal internals change.
+- **Path limits in `ElixirFs::call`.** bashkit's bulk `FileSystem::walk` hook
+  reads a mounted backend directly, below the `MountableFs` layer that applies
+  the depth/length caps. Without our guard a self-listing backend is walked
+  ~10k levels deep and `du` overflows the native stack, killing the VM. Run
+  `test/ex_bashkit/session_vfs_malformed_listing_test.exs` and, when upstream
+  adds a recursive walker, try it against an infinitely deep `:virtual_fs`.
+
+Behaviour changes do not show up as build failures. After the build is green,
+diff a handful of script outputs between the old and new pin (virtual-mount
+listings, `date` with a named `TZ`, restoring a snapshot written by the last
+published release) before pinning.
 
 ---
 
@@ -90,16 +105,20 @@ must be compared with the new bashkit source on every bump:
 In `native/ex_bashkit/Cargo.toml`:
 
 ```toml
-# bashkit = { version = "=0.13.0", default-features = false, features = ["realfs", "jq"] }
-bashkit = { path = "../../../bashkit/crates/bashkit", default-features = false, features = ["realfs", "jq"] }
+# bashkit = { version = "=0.21.0", default-features = false, features = ["realfs", "jq", "tzdata"] }
+bashkit = { path = "../../../bashkit/crates/bashkit", default-features = false, features = ["realfs", "jq", "tzdata"] }
 ```
 
-(Assumes a bashkit checkout at `../bashkit` relative to the project root.)
+(Assumes a bashkit checkout at `../bashkit` relative to the project root, with
+the target tag checked out: `git -C ../bashkit checkout v<NEW>`.)
 
 > **Keep the feature set in sync.** We build `default-features = false` plus
-> dependency features `realfs` and `jq`. Network is enabled through *our crate's*
-> default `http_client = ["bashkit/http_client"]` feature mapping. Carry both the
-> dependency features and that mapping through the path-dep swap and re-pin.
+> dependency features `realfs`, `jq`, and `tzdata`. Network is enabled through
+> *our crate's* default `http_client = ["bashkit/http_client", "bashkit/ring"]`
+> feature mapping. Carry both the dependency features and that mapping through
+> the path-dep swap and re-pin. Because we opt out of defaults, check upstream's
+> `default = [...]` list on every bump: anything newly moved behind a default-on
+> feature (as `ring` and `tzdata` were in 0.17) silently disappears for us.
 
 ### 3.2 Build and fix
 
@@ -136,12 +155,13 @@ CHANGELOG `[Unreleased]` entry from the **user's** perspective.
 ### 4.1 Re-pin to the exact released version
 
 ```toml
-bashkit = { version = "=0.<new>.0", default-features = false, features = ["realfs", "jq"] }
+bashkit = { version = "=0.<new>.0", default-features = false, features = ["realfs", "jq", "tzdata"] }
 # path dep commented out
 ```
 
 ```bash
-cd native/ex_bashkit && cargo update -p bashkit
+cd native/ex_bashkit && cargo update      # also refreshes transitive deps
+cargo audit                               # must be clean on the final lockfile
 cd ../.. && mix clean && EXBASHKIT_BUILD=1 mix test
 ```
 

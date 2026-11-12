@@ -16,8 +16,12 @@ crate-type = ["cdylib"]
 # "http_client")]` gates in src/lib.rs are real (a `cfg(feature = ...)` checks
 # *this* crate's features, not the dependency's). On by default → baked into the
 # shipped NIF. Build with `--no-default-features` to drop reqwest/rustls.
+#
+# Since bashkit 0.17 `http_client` no longer implies a rustls crypto backend:
+# one of `ring` / `aws-lc-rs` must be chosen or the build fails. We keep `ring`
+# (the pre-0.17 behavior).
 default = ["http_client"]
-http_client = ["bashkit/http_client"]
+http_client = ["bashkit/http_client", "bashkit/ring"]
 
 [dependencies]
 rustler = "0.38"
@@ -26,10 +30,13 @@ rustler = "0.38"
 # an exact semver. Bump deliberately via UPDATE_PROCEDURE.md.
 #
 # Feature notes (see PORTING.md "Feature flags"):
-#   - default = ["bash_tool"] — the Rust-side LLM tool wrapper. We build our own
+#   - default = ["bash_tool", "ring", "tzdata"] — bash_tool is the Rust-side LLM tool wrapper. We build our own
 #     tool contract on the Elixir side, so we start with default-features = false.
-#   - "python" needs monty, which is a GIT dep upstream — NOT available from the
-#     crates.io build of bashkit. Enabling it requires a git source. Left off for now.
+#   - "python" (bashkit's native interpreter) is off: ExBashkit ships `python`
+#     as an Elixir builtin backed by the optional ex_monty dep instead. Since
+#     bashkit 0.21 the monty forks are on crates.io (`bashkit-monty`), so the
+#     feature no longer needs a git source, but it requires installing
+#     `bashkit::MeteredAllocator` as the global allocator.
 #   - "sqlite" pulls turso (multi-MB) and needs tokio/rt-multi-thread.
 #   - "typescript", "git", "ssh", "jq" are each opt-in.
 #
@@ -51,9 +58,12 @@ rustler = "0.38"
 # the LLM-agent use case; it's pure computation (no I/O/escape surface), so it
 # needs no runtime gate. Baked into the shipped NIF; not cfg-gated in our code
 # because we never reference jq from Rust (it's purely a bashkit builtin).
-bashkit = { version = "=0.16.0", default-features = false, features = ["realfs", "jq"] }
+# "tzdata" (chrono-tz) keeps `TZ=<named zone>` working in `date`. bashkit moved
+# timezone data behind this default-on feature in 0.17; since we build with
+# default-features = false we must name it, or `date` exits 1 for named zones.
+bashkit = { version = "=0.21.0", default-features = false, features = ["realfs", "jq", "tzdata"] }
 # For local iteration against a checkout, comment the line above and use:
-# bashkit = { path = "../../../bashkit/crates/bashkit", default-features = false, features = ["realfs", "jq"] }
+# bashkit = { path = "../../../bashkit/crates/bashkit", default-features = false, features = ["realfs", "jq", "tzdata"] }
 
 # bashkit's `exec` is async (tokio). We host a single shared runtime and
 # block_on it from inside dirty NIFs. See src/lib.rs.
